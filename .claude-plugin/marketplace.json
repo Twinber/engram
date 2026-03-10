@@ -14,7 +14,11 @@
       "author": {
         "name": "Gentleman Programming"
       },
-      "source": "./plugin/claude-code",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/Gentleman-Programming/engram.git",
+        "path": "plugin/claude-code"
+      },
       "category": "productivity",
       "homepage": "https://github.com/Gentleman-Programming/engram"
     }
