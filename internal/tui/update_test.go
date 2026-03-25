@@ -6,6 +6,7 @@ import (
 
 	"github.com/Gentleman-Programming/engram/internal/setup"
 	"github.com/Gentleman-Programming/engram/internal/store"
+	"github.com/Gentleman-Programming/engram/internal/version"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -321,8 +322,14 @@ func TestRefreshScreen(t *testing.T) {
 func TestUpdateDataMessageBranches(t *testing.T) {
 	m := New(nil, "")
 
-	updatedModel, _ := m.Update(statsLoadedMsg{err: errors.New("stats err")})
+	updatedModel, _ := m.Update(updateCheckMsg{result: version.CheckResult{Status: version.StatusCheckFailed, Message: "Could not check for updates: GitHub took too long to respond."}})
 	updated := updatedModel.(Model)
+	if updated.UpdateStatus != version.StatusCheckFailed || updated.UpdateMsg != "Could not check for updates: GitHub took too long to respond." {
+		t.Fatal("update check failure should persist status and message")
+	}
+
+	updatedModel, _ = m.Update(statsLoadedMsg{err: errors.New("stats err")})
+	updated = updatedModel.(Model)
 	if updated.ErrorMsg != "stats err" {
 		t.Fatalf("error = %q", updated.ErrorMsg)
 	}

@@ -4,18 +4,38 @@ package version
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"time"
 )
 
 const (
-	repoOwner    = "Gentleman-Programming"
-	repoName     = "engram"
-	checkTimeout = 2 * time.Second
+	repoOwner = "Gentleman-Programming"
+	repoName  = "engram"
 )
+
+var (
+	checkTimeout           = 2 * time.Second
+	githubLatestReleaseURL = fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", repoOwner, repoName)
+	httpClient             = http.DefaultClient
+)
+
+type CheckStatus string
+
+const (
+	StatusUpToDate        CheckStatus = "up_to_date"
+	StatusUpdateAvailable CheckStatus = "update_available"
+	StatusCheckFailed     CheckStatus = "check_failed"
+)
+
+type CheckResult struct {
+	Status  CheckStatus
+	Message string
+}
 
 // githubRelease is the subset of the GitHub releases API we care about.
 type githubRelease struct {
@@ -23,53 +43,67 @@ type githubRelease struct {
 }
 
 // CheckLatest compares the running version against the latest GitHub release.
-// Returns a user-facing message if an update is available, or "" if up to date.
-// Never returns an error — silently returns "" on any failure (no network, timeout, etc.).
-func CheckLatest(current string) string {
-	if current == "" || current == "dev" {
-		return ""
+// It distinguishes between up-to-date, update available, and check failures.
+func CheckLatest(current string) CheckResult {
+	switch current {
+	case "":
+		return checkFailed("Could not check for updates: current version is unknown.")
+	case "dev":
+		return checkFailed("Could not check for updates: development builds do not map to a release version.")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), checkTimeout)
 	defer cancel()
 
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", repoOwner, repoName)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, githubLatestReleaseURL, nil)
 	if err != nil {
-		return ""
+		return checkFailed("Could not check for updates: could not create the GitHub request.")
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
+	if token := githubToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return ""
+		if errors.Is(err, context.DeadlineExceeded) {
+			return checkFailed("Could not check for updates: GitHub took too long to respond.")
+		}
+		return checkFailed(fmt.Sprintf("Could not check for updates: %v.", err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return ""
+		return checkFailed(nonOKStatusMessage(resp.Status))
 	}
 
 	var release githubRelease
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return ""
+		return checkFailed("Could not check for updates: could not read the GitHub response.")
 	}
 
 	latest := normalizeVersion(release.TagName)
 	running := normalizeVersion(current)
 
-	if latest == "" || latest == running {
-		return ""
+	if latest == "" {
+		return checkFailed("Could not check for updates: GitHub did not return a release version.")
+	}
+
+	if latest == running {
+		return CheckResult{Status: StatusUpToDate}
 	}
 
 	if !isNewer(latest, running) {
-		return ""
+		return CheckResult{Status: StatusUpToDate}
 	}
 
-	return fmt.Sprintf(
-		"Update available: %s → %s\n%s",
-		running, latest, updateInstructions(),
-	)
+	return CheckResult{
+		Status: StatusUpdateAvailable,
+		Message: fmt.Sprintf(
+			"Update available: %s -> %s\nTo update:\n%s",
+			running, latest, updateInstructions(),
+		),
+	}
 }
 
 // normalizeVersion strips a leading "v" prefix.
@@ -122,4 +156,23 @@ func updateInstructions() string {
 	default:
 		return "  go install github.com/Gentleman-Programming/engram/cmd/engram@latest\n  or: https://github.com/Gentleman-Programming/engram/releases/latest"
 	}
+}
+
+func githubToken() string {
+	if token := strings.TrimSpace(os.Getenv("GH_TOKEN")); token != "" {
+		return token
+	}
+	return strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
+}
+
+func nonOKStatusMessage(status string) string {
+	msg := fmt.Sprintf("Could not check for updates: GitHub API returned %s.", status)
+	if strings.HasPrefix(status, "401") || strings.HasPrefix(status, "403") {
+		msg += " Set GH_TOKEN or GITHUB_TOKEN to reduce rate limits."
+	}
+	return msg
+}
+
+func checkFailed(message string) CheckResult {
+	return CheckResult{Status: StatusCheckFailed, Message: message}
 }

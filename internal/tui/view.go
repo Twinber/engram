@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/version"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -101,7 +102,11 @@ func (m Model) viewDashboard() string {
 
 	// Update notification
 	if m.UpdateMsg != "" {
-		b.WriteString(updateBannerStyle.Render(m.UpdateMsg))
+		bannerStyle := updateBannerStyle
+		if m.UpdateStatus == version.StatusCheckFailed {
+			bannerStyle = errorStyle
+		}
+		b.WriteString(bannerStyle.Render(m.UpdateMsg))
 		b.WriteString("\n\n")
 	}
 
