@@ -91,9 +91,9 @@ func main() {
 		exitFunc(1)
 	}
 
-	// Check for updates on every invocation (2s timeout, silent on failure).
-	if msg := checkForUpdates(version); msg != "" {
-		fmt.Fprintln(os.Stderr, msg)
+	// Check for updates on every invocation.
+	if result := checkForUpdates(version); result.Status != versioncheck.StatusUpToDate && result.Message != "" {
+		fmt.Fprintln(os.Stderr, result.Message)
 		fmt.Fprintln(os.Stderr)
 	}
 
@@ -643,7 +643,7 @@ func cmdSync(cfg store.Config) {
 		}
 
 		if result.ChunksImported == 0 {
-			fmt.Println("Already up to date — no new chunks to import.")
+			fmt.Println("No new chunks to import.")
 			if result.ChunksSkipped > 0 {
 				fmt.Printf("  (%d chunks already imported)\n", result.ChunksSkipped)
 			}

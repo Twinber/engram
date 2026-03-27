@@ -38,8 +38,8 @@ const (
 
 // ─── Custom Messages ─────────────────────────────────────────────────────────
 
-type updateAvailableMsg struct {
-	msg string
+type updateCheckMsg struct {
+	result version.CheckResult
 }
 
 type statsLoadedMsg struct {
@@ -96,7 +96,8 @@ type Model struct {
 	Scroll     int
 
 	// Update notification
-	UpdateMsg string
+	UpdateStatus version.CheckStatus
+	UpdateMsg    string
 
 	// Error display
 	ErrorMsg string
@@ -171,7 +172,7 @@ func (m Model) Init() tea.Cmd {
 
 func checkForUpdate(v string) tea.Cmd {
 	return func() tea.Msg {
-		return updateAvailableMsg{msg: version.CheckLatest(v)}
+		return updateCheckMsg{result: version.CheckLatest(v)}
 	}
 }
 

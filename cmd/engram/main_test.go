@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Gentleman-Programming/engram/internal/store"
+	versioncheck "github.com/Gentleman-Programming/engram/internal/version"
 )
 
 func testConfig(t *testing.T) store.Config {
@@ -43,6 +44,13 @@ func withCwd(t *testing.T, dir string) {
 	t.Cleanup(func() {
 		_ = os.Chdir(old)
 	})
+}
+
+func stubCheckForUpdates(t *testing.T, result versioncheck.CheckResult) {
+	t.Helper()
+	old := checkForUpdates
+	checkForUpdates = func(string) versioncheck.CheckResult { return result }
+	t.Cleanup(func() { checkForUpdates = old })
 }
 
 func captureOutput(t *testing.T, fn func()) (stdout string, stderr string) {
@@ -449,7 +457,7 @@ func TestCmdSyncStatusExportAndImport(t *testing.T) {
 	if noopErr != "" {
 		t.Fatalf("expected no stderr from second sync import, got: %q", noopErr)
 	}
-	if !strings.Contains(noopOut, "Already up to date") {
+	if !strings.Contains(noopOut, "No new chunks to import") {
 		t.Fatalf("unexpected second sync import output: %q", noopOut)
 	}
 }
@@ -479,6 +487,7 @@ func TestMainVersionAndHelpAliases(t *testing.T) {
 	oldVersion := version
 	version = "9.9.9-test"
 	t.Cleanup(func() { version = oldVersion })
+	stubCheckForUpdates(t, versioncheck.CheckResult{Status: versioncheck.StatusUpToDate})
 
 	tests := []struct {
 		name      string
@@ -506,6 +515,57 @@ func TestMainVersionAndHelpAliases(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMainPrintsUpdateFailuresAndUpdates(t *testing.T) {
+	oldVersion := version
+	version = "1.10.7"
+	t.Cleanup(func() { version = oldVersion })
+
+	t.Run("prints check failure", func(t *testing.T) {
+		stubCheckForUpdates(t, versioncheck.CheckResult{
+			Status:  versioncheck.StatusCheckFailed,
+			Message: "Could not check for updates: GitHub took too long to respond.",
+		})
+		withArgs(t, "engram", "version")
+
+		stdout, stderr := captureOutput(t, func() { main() })
+		if !strings.Contains(stdout, "engram 1.10.7") {
+			t.Fatalf("stdout = %q", stdout)
+		}
+		if !strings.Contains(stderr, "Could not check for updates") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+	})
+
+	t.Run("prints available update", func(t *testing.T) {
+		stubCheckForUpdates(t, versioncheck.CheckResult{
+			Status:  versioncheck.StatusUpdateAvailable,
+			Message: "Update available: 1.10.7 -> 1.10.8",
+		})
+		withArgs(t, "engram", "version")
+
+		stdout, stderr := captureOutput(t, func() { main() })
+		if !strings.Contains(stdout, "engram 1.10.7") {
+			t.Fatalf("stdout = %q", stdout)
+		}
+		if !strings.Contains(stderr, "Update available") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+	})
+
+	t.Run("prints nothing when up to date", func(t *testing.T) {
+		stubCheckForUpdates(t, versioncheck.CheckResult{Status: versioncheck.StatusUpToDate})
+		withArgs(t, "engram", "version")
+
+		stdout, stderr := captureOutput(t, func() { main() })
+		if !strings.Contains(stdout, "engram 1.10.7") {
+			t.Fatalf("stdout = %q", stdout)
+		}
+		if stderr != "" {
+			t.Fatalf("stderr = %q, want empty", stderr)
+		}
+	})
 }
 
 func TestMainExitPaths(t *testing.T) {

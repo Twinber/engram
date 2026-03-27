@@ -28,8 +28,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKeyPress(msg.String())
 
 	// ─── Data loaded messages ────────────────────────────────────────────
-	case updateAvailableMsg:
-		m.UpdateMsg = msg.msg
+	case updateCheckMsg:
+		m.UpdateStatus = msg.result.Status
+		m.UpdateMsg = msg.result.Message
 		return m, nil
 
 	case statsLoadedMsg:

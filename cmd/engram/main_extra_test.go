@@ -16,6 +16,7 @@ import (
 	"github.com/Gentleman-Programming/engram/internal/store"
 	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
 	"github.com/Gentleman-Programming/engram/internal/tui"
+	versioncheck "github.com/Gentleman-Programming/engram/internal/version"
 
 	tea "github.com/charmbracelet/bubbletea"
 	mcpserver "github.com/mark3labs/mcp-go/server"
@@ -96,6 +97,7 @@ func stubRuntimeHooks(t *testing.T) {
 	oldSyncStatus := syncStatus
 	oldSyncImport := syncImport
 	oldSyncExport := syncExport
+	oldCheckForUpdates := checkForUpdates
 
 	storeNew = store.New
 	newHTTPServer = func(s *store.Store, _ int) *engramsrv.Server { return engramsrv.New(s, 0) }
@@ -135,6 +137,9 @@ func stubRuntimeHooks(t *testing.T) {
 	syncExport = func(sy *engramsync.Syncer, createdBy, project string) (*engramsync.SyncResult, error) {
 		return sy.Export(createdBy, project)
 	}
+	checkForUpdates = func(string) versioncheck.CheckResult {
+		return versioncheck.CheckResult{Status: versioncheck.StatusUpToDate}
+	}
 
 	t.Cleanup(func() {
 		storeNew = oldStoreNew
@@ -159,6 +164,7 @@ func stubRuntimeHooks(t *testing.T) {
 		syncStatus = oldSyncStatus
 		syncImport = oldSyncImport
 		syncExport = oldSyncExport
+		checkForUpdates = oldCheckForUpdates
 	})
 }
 
@@ -742,7 +748,7 @@ func TestCmdSyncImportEmptyAndMixedChunks(t *testing.T) {
 		if recovered != nil || stderr != "" {
 			t.Fatalf("empty import failed: panic=%v stderr=%q", recovered, stderr)
 		}
-		if !strings.Contains(stdout, "Already up to date") || strings.Contains(stdout, "already imported") {
+		if !strings.Contains(stdout, "No new chunks to import") || strings.Contains(stdout, "already imported") {
 			t.Fatalf("unexpected empty import output: %q", stdout)
 		}
 	})

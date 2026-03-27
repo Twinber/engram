@@ -1253,8 +1253,7 @@ func TestCoreToolsAreNotDeferred(t *testing.T) {
 
 	coreTools := []string{
 		"mem_save", "mem_search", "mem_context", "mem_session_summary",
-		"mem_update", "mem_suggest_topic_key", "mem_save_prompt",
-		"mem_get_observation", "mem_session_start", "mem_session_end",
+		"mem_get_observation", "mem_save_prompt",
 	}
 	for _, name := range coreTools {
 		tool := tools[name]
@@ -1274,6 +1273,8 @@ func TestNonCoreToolsAreDeferred(t *testing.T) {
 	tools := srv.ListTools()
 
 	deferredTools := []string{
+		"mem_update", "mem_suggest_topic_key",
+		"mem_session_start", "mem_session_end",
 		"mem_stats", "mem_delete", "mem_timeline",
 		"mem_capture_passive",
 	}

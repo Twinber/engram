@@ -479,6 +479,7 @@ func (s *Store) migrate() error {
 			tool_name,
 			type,
 			project,
+			topic_key,
 			content='observations',
 			content_rowid='id'
 		);
@@ -641,25 +642,29 @@ func (s *Store) migrate() error {
 	if err == sql.ErrNoRows {
 		triggers := `
 			CREATE TRIGGER obs_fts_insert AFTER INSERT ON observations BEGIN
-				INSERT INTO observations_fts(rowid, title, content, tool_name, type, project)
-				VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project);
+				INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
+				VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
 			END;
 
 			CREATE TRIGGER obs_fts_delete AFTER DELETE ON observations BEGIN
-				INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project)
-				VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project);
+				INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
+				VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
 			END;
 
 			CREATE TRIGGER obs_fts_update AFTER UPDATE ON observations BEGIN
-				INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project)
-				VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project);
-				INSERT INTO observations_fts(rowid, title, content, tool_name, type, project)
-				VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project);
+				INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
+				VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
+				INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
+				VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
 			END;
 		`
 		if _, err := s.execHook(s.db, triggers); err != nil {
 			return err
 		}
+	}
+
+	if err := s.migrateFTSTopicKey(); err != nil {
+		return err
 	}
 
 	// Prompts FTS triggers (separate idempotent check)
@@ -692,6 +697,55 @@ func (s *Store) migrate() error {
 		}
 	}
 
+	return nil
+}
+
+func (s *Store) migrateFTSTopicKey() error {
+	var colCount int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM pragma_table_xinfo('observations_fts') WHERE name = 'topic_key'").Scan(&colCount)
+	if err != nil || colCount > 0 {
+		return nil
+	}
+
+	if _, err := s.execHook(s.db, `
+		DROP TRIGGER IF EXISTS obs_fts_insert;
+		DROP TRIGGER IF EXISTS obs_fts_update;
+		DROP TRIGGER IF EXISTS obs_fts_delete;
+		DROP TABLE IF EXISTS observations_fts;
+		CREATE VIRTUAL TABLE observations_fts USING fts5(
+			title,
+			content,
+			tool_name,
+			type,
+			project,
+			topic_key,
+			content='observations',
+			content_rowid='id'
+		);
+		INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
+		SELECT id, title, content, tool_name, type, project, topic_key
+		FROM observations
+		WHERE deleted_at IS NULL;
+
+		CREATE TRIGGER obs_fts_insert AFTER INSERT ON observations BEGIN
+			INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
+			VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
+		END;
+
+		CREATE TRIGGER obs_fts_delete AFTER DELETE ON observations BEGIN
+			INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
+			VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
+		END;
+
+		CREATE TRIGGER obs_fts_update AFTER UPDATE ON observations BEGIN
+			INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
+			VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
+			INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
+			VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
+		END;
+	`); err != nil {
+		return fmt.Errorf("migrate fts topic_key: %w", err)
+	}
 	return nil
 }
 
@@ -1396,10 +1450,54 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		limit = s.cfg.MaxSearchResults
 	}
 
+	var directResults []SearchResult
+	if strings.Contains(query, "/") {
+		tkSQL := `
+			SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
+			       scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+			FROM observations
+			WHERE topic_key = ? AND deleted_at IS NULL
+		`
+		tkArgs := []any{query}
+
+		if opts.Type != "" {
+			tkSQL += " AND type = ?"
+			tkArgs = append(tkArgs, opts.Type)
+		}
+		if opts.Project != "" {
+			tkSQL += " AND project = ?"
+			tkArgs = append(tkArgs, opts.Project)
+		}
+		if opts.Scope != "" {
+			tkSQL += " AND scope = ?"
+			tkArgs = append(tkArgs, normalizeScope(opts.Scope))
+		}
+
+		tkSQL += " ORDER BY updated_at DESC LIMIT ?"
+		tkArgs = append(tkArgs, limit)
+
+		tkRows, err := s.queryItHook(s.db, tkSQL, tkArgs...)
+		if err == nil {
+			defer tkRows.Close()
+			for tkRows.Next() {
+				var sr SearchResult
+				if err := tkRows.Scan(
+					&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
+					&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
+					&sr.LastSeenAt, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
+				); err != nil {
+					break
+				}
+				sr.Rank = -1000
+				directResults = append(directResults, sr)
+			}
+		}
+	}
+
 	// Sanitize query for FTS5 — wrap each term in quotes to avoid syntax errors
 	ftsQuery := sanitizeFTS(query)
 
-	sql := `
+	sqlQ := `
 		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
 		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at,
 		       fts.rank
@@ -1410,30 +1508,36 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 	args := []any{ftsQuery}
 
 	if opts.Type != "" {
-		sql += " AND o.type = ?"
+		sqlQ += " AND o.type = ?"
 		args = append(args, opts.Type)
 	}
 
 	if opts.Project != "" {
-		sql += " AND o.project = ?"
+		sqlQ += " AND o.project = ?"
 		args = append(args, opts.Project)
 	}
 
 	if opts.Scope != "" {
-		sql += " AND o.scope = ?"
+		sqlQ += " AND o.scope = ?"
 		args = append(args, normalizeScope(opts.Scope))
 	}
 
-	sql += " ORDER BY fts.rank LIMIT ?"
+	sqlQ += " ORDER BY fts.rank LIMIT ?"
 	args = append(args, limit)
 
-	rows, err := s.queryItHook(s.db, sql, args...)
+	rows, err := s.queryItHook(s.db, sqlQ, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)
 	}
 	defer rows.Close()
 
+	seen := make(map[int64]bool)
+	for _, dr := range directResults {
+		seen[dr.ID] = true
+	}
+
 	var results []SearchResult
+	results = append(results, directResults...)
 	for rows.Next() {
 		var sr SearchResult
 		if err := rows.Scan(
@@ -1444,9 +1548,18 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		); err != nil {
 			return nil, err
 		}
-		results = append(results, sr)
+		if !seen[sr.ID] {
+			results = append(results, sr)
+		}
 	}
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(results) > limit {
+		results = results[:limit]
+	}
+	return results, nil
 }
 
 // ─── Stats ───────────────────────────────────────────────────────────────────
@@ -2712,11 +2825,12 @@ func (s *Store) migrateLegacyObservationsTable() error {
 			tool_name,
 			type,
 			project,
+			topic_key,
 			content='observations',
 			content_rowid='id'
 		);
-		INSERT INTO observations_fts(rowid, title, content, tool_name, type, project)
-		SELECT id, title, content, tool_name, type, project
+		INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
+		SELECT id, title, content, tool_name, type, project, topic_key
 		FROM observations
 		WHERE deleted_at IS NULL;
 	`); err != nil {

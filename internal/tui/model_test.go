@@ -6,6 +6,7 @@ import (
 
 	"github.com/Gentleman-Programming/engram/internal/setup"
 	"github.com/Gentleman-Programming/engram/internal/store"
+	"github.com/Gentleman-Programming/engram/internal/version"
 )
 
 type testFixture struct {
@@ -94,6 +95,17 @@ func TestInitReturnsCommand(t *testing.T) {
 
 func TestDataLoadingCommands(t *testing.T) {
 	fx := newTestFixture(t)
+
+	t.Run("checkForUpdate", func(t *testing.T) {
+		msg := checkForUpdate("dev")()
+		loaded, ok := msg.(updateCheckMsg)
+		if !ok {
+			t.Fatalf("message type = %T", msg)
+		}
+		if loaded.result.Status != version.StatusCheckFailed {
+			t.Fatalf("status = %q, want %q", loaded.result.Status, version.StatusCheckFailed)
+		}
+	})
 
 	t.Run("loadStats", func(t *testing.T) {
 		msg := loadStats(fx.store)()

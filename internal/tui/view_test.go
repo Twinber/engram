@@ -6,6 +6,7 @@ import (
 
 	"github.com/Gentleman-Programming/engram/internal/setup"
 	"github.com/Gentleman-Programming/engram/internal/store"
+	"github.com/Gentleman-Programming/engram/internal/version"
 )
 
 func TestTruncateStr(t *testing.T) {
@@ -149,6 +150,20 @@ func TestViewDashboardSearchAndRecent(t *testing.T) {
 	}
 	if !strings.Contains(out, "...and 1 more projects") {
 		t.Fatal("dashboard should show overflow projects indicator")
+	}
+
+	m.UpdateStatus = version.StatusUpdateAvailable
+	m.UpdateMsg = "Update available: 1.10.7 -> 1.10.8"
+	out = m.viewDashboard()
+	if !strings.Contains(out, "Update available") {
+		t.Fatal("dashboard should render update banner")
+	}
+
+	m.UpdateStatus = version.StatusCheckFailed
+	m.UpdateMsg = "Could not check for updates: GitHub took too long to respond."
+	out = m.viewDashboard()
+	if !strings.Contains(out, "Could not check for updates") {
+		t.Fatal("dashboard should render update failure banner")
 	}
 
 	m.Stats = nil

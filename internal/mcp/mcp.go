@@ -112,8 +112,8 @@ func NewServer(s *store.Store) *server.MCPServer {
 }
 
 // serverInstructions tells MCP clients when to use Engram's tools.
-// Most tools are eager (always available in context). Only 4 admin tools
-// are deferred and require ToolSearch to load.
+// 6 core tools are eager (always in context). The rest are deferred
+// and require ToolSearch to load.
 const serverInstructions = `Engram provides persistent memory that survives across sessions and compactions.
 
 CORE TOOLS (always available — use without ToolSearch):
@@ -122,13 +122,10 @@ CORE TOOLS (always available — use without ToolSearch):
   mem_context — get recent session history (call at session start or after compaction)
   mem_session_summary — save end-of-session summary (MANDATORY before saying "done")
   mem_get_observation — get full untruncated content of a search result by ID
-  mem_suggest_topic_key — get a stable topic_key for upserts
-  mem_update — update an existing observation by ID
-  mem_session_start — register session start
-  mem_session_end — mark session completed
   mem_save_prompt — save user prompt for context
 
-ADMIN TOOLS (deferred — use ToolSearch only when needed):
+DEFERRED TOOLS (use ToolSearch when needed):
+  mem_update, mem_suggest_topic_key, mem_session_start, mem_session_end,
   mem_stats, mem_delete, mem_timeline, mem_capture_passive
 
 PROACTIVE SAVE RULE: Call mem_save immediately after ANY decision, bug fix, discovery, or convention — not just when asked.`
@@ -251,11 +248,12 @@ Examples:
 		)
 	}
 
-	// ─── mem_update (profile: agent, eager) ─────────────────────────────
+	// ─── mem_update (profile: agent, deferred) ──────────────────────────
 	if shouldRegister("mem_update", allowlist) {
 		srv.AddTool(
 			mcp.NewTool("mem_update",
 				mcp.WithDescription("Update an existing observation by ID. Only provided fields are changed."),
+				mcp.WithDeferLoading(true),
 				mcp.WithTitleAnnotation("Update Memory"),
 				mcp.WithReadOnlyHintAnnotation(false),
 				mcp.WithDestructiveHintAnnotation(false),
@@ -288,11 +286,12 @@ Examples:
 		)
 	}
 
-	// ─── mem_suggest_topic_key (profile: agent, eager) ──────────────────
+	// ─── mem_suggest_topic_key (profile: agent, deferred) ───────────────
 	if shouldRegister("mem_suggest_topic_key", allowlist) {
 		srv.AddTool(
 			mcp.NewTool("mem_suggest_topic_key",
 				mcp.WithDescription("Suggest a stable topic_key for memory upserts. Use this before mem_save when you want evolving topics (like architecture decisions) to update a single observation over time."),
+				mcp.WithDeferLoading(true),
 				mcp.WithTitleAnnotation("Suggest Topic Key"),
 				mcp.WithReadOnlyHintAnnotation(true),
 				mcp.WithDestructiveHintAnnotation(false),
@@ -500,11 +499,12 @@ GUIDELINES:
 		)
 	}
 
-	// ─── mem_session_start (profile: agent, eager) ──────────────────────
+	// ─── mem_session_start (profile: agent, deferred) ───────────────────
 	if shouldRegister("mem_session_start", allowlist) {
 		srv.AddTool(
 			mcp.NewTool("mem_session_start",
 				mcp.WithDescription("Register the start of a new coding session. Call this at the beginning of a session to track activity."),
+				mcp.WithDeferLoading(true),
 				mcp.WithTitleAnnotation("Start Session"),
 				mcp.WithReadOnlyHintAnnotation(false),
 				mcp.WithDestructiveHintAnnotation(false),
@@ -526,11 +526,12 @@ GUIDELINES:
 		)
 	}
 
-	// ─── mem_session_end (profile: agent, eager) ────────────────────────
+	// ─── mem_session_end (profile: agent, deferred) ─────────────────────
 	if shouldRegister("mem_session_end", allowlist) {
 		srv.AddTool(
 			mcp.NewTool("mem_session_end",
 				mcp.WithDescription("Mark a coding session as completed with an optional summary."),
+				mcp.WithDeferLoading(true),
 				mcp.WithTitleAnnotation("End Session"),
 				mcp.WithReadOnlyHintAnnotation(false),
 				mcp.WithDestructiveHintAnnotation(false),
