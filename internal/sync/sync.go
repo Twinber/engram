@@ -123,6 +123,69 @@ type Syncer struct {
 	project   string
 }
 
+type UpgradeBootstrapOptions struct {
+	Project   string
+	CreatedBy string
+}
+
+type UpgradeBootstrapResult struct {
+	Project string
+	Stage   string
+	Resumed bool
+	NoOp    bool
+}
+
+type UpgradeLifecycleHooks interface {
+	StopForUpgrade(project string) error
+	ResumeAfterUpgrade(project string) error
+}
+
+type UpgradeRollbackOptions struct {
+	Project string
+	Hooks   UpgradeLifecycleHooks
+}
+
+func RollbackProject(s *store.Store, opts UpgradeRollbackOptions) (*store.CloudUpgradeState, error) {
+	if s == nil {
+		return nil, fmt.Errorf("cloud upgrade rollback requires store")
+	}
+	project, _ := store.NormalizeProject(opts.Project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil, fmt.Errorf("cloud upgrade rollback requires project")
+	}
+
+	canRollback, err := s.CanRollbackCloudUpgrade(project)
+	if err != nil {
+		return nil, fmt.Errorf("cloud upgrade rollback boundary check: %w", err)
+	}
+	if !canRollback {
+		return nil, fmt.Errorf("rollback is unavailable post-bootstrap; use explicit disconnect/unenroll flows")
+	}
+
+	if opts.Hooks != nil {
+		if err := opts.Hooks.StopForUpgrade(project); err != nil {
+			return nil, fmt.Errorf("cloud upgrade rollback stop autosync: %w", err)
+		}
+	}
+
+	rolledBackState, rollbackErr := s.RollbackCloudUpgrade(project)
+	if rollbackErr != nil {
+		if opts.Hooks != nil {
+			_ = opts.Hooks.ResumeAfterUpgrade(project)
+		}
+		return nil, rollbackErr
+	}
+
+	if opts.Hooks != nil {
+		if err := opts.Hooks.ResumeAfterUpgrade(project); err != nil {
+			return nil, fmt.Errorf("cloud upgrade rollback resume autosync: %w", err)
+		}
+	}
+
+	return &rolledBackState, nil
+}
+
 // New creates a Syncer with a FileTransport rooted at syncDir.
 // This preserves the original constructor signature for backward compatibility.
 func New(s *store.Store, syncDir string) *Syncer {
@@ -157,6 +220,110 @@ func NewCloudWithTransport(s *store.Store, transport Transport, project string) 
 		transport: transport,
 		cloudMode: true,
 		project:   strings.TrimSpace(project),
+	}
+}
+
+func BootstrapProject(s *store.Store, transport Transport, opts UpgradeBootstrapOptions) (*UpgradeBootstrapResult, error) {
+	if s == nil {
+		return nil, fmt.Errorf("cloud upgrade bootstrap requires store")
+	}
+	project, _ := store.NormalizeProject(opts.Project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil, fmt.Errorf("cloud upgrade bootstrap requires project")
+	}
+	createdBy := strings.TrimSpace(opts.CreatedBy)
+	if createdBy == "" {
+		createdBy = "upgrade-bootstrap"
+	}
+
+	state, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		return nil, fmt.Errorf("read cloud upgrade checkpoint: %w", err)
+	}
+	currentStage := store.UpgradeStagePlanned
+	if state != nil {
+		currentStage = state.Stage
+	}
+	if currentStage == store.UpgradeStageBootstrapVerified {
+		return &UpgradeBootstrapResult{Project: project, Stage: currentStage, Resumed: true, NoOp: true}, nil
+	}
+
+	resumed := currentStage != store.UpgradeStagePlanned
+
+	if upgradeStageOrder(currentStage) < upgradeStageOrder(store.UpgradeStageBootstrapEnrolled) {
+		if err := s.EnrollProject(project); err != nil {
+			return nil, fmt.Errorf("bootstrap enroll project: %w", err)
+		}
+		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+			Project:     project,
+			Stage:       store.UpgradeStageBootstrapEnrolled,
+			RepairClass: store.UpgradeRepairClassRepairable,
+		}); err != nil {
+			return nil, fmt.Errorf("persist bootstrap checkpoint enrolled: %w", err)
+		}
+		currentStage = store.UpgradeStageBootstrapEnrolled
+	}
+
+	sy := NewCloudWithTransport(s, transport, project)
+	enrolled, err := s.IsProjectEnrolled(project)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap enrollment verify: %w", err)
+	}
+	if !enrolled {
+		if err := s.EnrollProject(project); err != nil {
+			return nil, fmt.Errorf("bootstrap enrollment repair: %w", err)
+		}
+	}
+	if upgradeStageOrder(currentStage) < upgradeStageOrder(store.UpgradeStageBootstrapPushed) {
+		if _, err := sy.Export(createdBy, project); err != nil {
+			return nil, fmt.Errorf("bootstrap first push: %w", err)
+		}
+		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+			Project:     project,
+			Stage:       store.UpgradeStageBootstrapPushed,
+			RepairClass: store.UpgradeRepairClassRepairable,
+		}); err != nil {
+			return nil, fmt.Errorf("persist bootstrap checkpoint pushed: %w", err)
+		}
+		currentStage = store.UpgradeStageBootstrapPushed
+	}
+
+	if upgradeStageOrder(currentStage) < upgradeStageOrder(store.UpgradeStageBootstrapVerified) {
+		if _, err := sy.Import(); err != nil {
+			return nil, fmt.Errorf("bootstrap verification pull: %w", err)
+		}
+		if _, _, _, err := sy.Status(); err != nil {
+			return nil, fmt.Errorf("bootstrap verification status: %w", err)
+		}
+		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+			Project:     project,
+			Stage:       store.UpgradeStageBootstrapVerified,
+			RepairClass: store.UpgradeRepairClassReady,
+		}); err != nil {
+			return nil, fmt.Errorf("persist bootstrap checkpoint verified: %w", err)
+		}
+		currentStage = store.UpgradeStageBootstrapVerified
+	}
+
+	return &UpgradeBootstrapResult{
+		Project: project,
+		Stage:   currentStage,
+		Resumed: resumed,
+		NoOp:    false,
+	}, nil
+}
+
+func upgradeStageOrder(stage string) int {
+	switch strings.TrimSpace(stage) {
+	case store.UpgradeStageBootstrapEnrolled:
+		return 1
+	case store.UpgradeStageBootstrapPushed:
+		return 2
+	case store.UpgradeStageBootstrapVerified:
+		return 3
+	default:
+		return 0
 	}
 }
 

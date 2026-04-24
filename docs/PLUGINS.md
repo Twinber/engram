@@ -2,9 +2,9 @@
 
 # Plugins
 
-> Deferred scope note: plugin-level automatic cloud enrollment/login wiring is not part of this rollout yet. Current cloud flows are CLI-driven (`engram cloud ...`).
+> Deferred scope note: plugin-level automatic cloud enrollment/login/upgrade orchestration is not part of this rollout yet. Current cloud flows are CLI-driven (`engram cloud ...`).
 >
-> Validation boundary (current): plugin scripts are validated for memory/session workflows, not as cloud bootstrap orchestrators. Use CLI for cloud config/auth/enrollment.
+> Validation boundary (current): plugin scripts are validated for memory/session workflows, not as cloud bootstrap orchestrators. Use CLI for cloud config/auth/enrollment/upgrade.
 
 - [OpenCode Plugin](#opencode-plugin)
 - [Claude Code Plugin](#claude-code-plugin)

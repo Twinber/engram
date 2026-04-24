@@ -121,7 +121,26 @@ type staticStatus struct{ status dashboard.SyncStatus }
 
 func (s staticStatus) Status() dashboard.SyncStatus { return s.status }
 
+type actionableErrorBody struct {
+	ErrorClass string `json:"error_class"`
+	ErrorCode  string `json:"error_code"`
+	Error      string `json:"error"`
+}
+
+func decodeActionableError(t *testing.T, rec *httptest.ResponseRecorder) actionableErrorBody {
+	t.Helper()
+	var body actionableErrorBody
+	if err := json.Unmarshal(bytes.TrimSpace(rec.Body.Bytes()), &body); err != nil {
+		t.Fatalf("decode actionable error payload: %v body=%q", err, rec.Body.String())
+	}
+	return body
+}
+
 func TestHandlerMountsDashboardAndHealth(t *testing.T) {
+	// UPDATED: Full auth-gated dashboard is now mounted. Unauthenticated /dashboard
+	// requests redirect to login instead of rendering status directly. Status fields
+	// (upgrade_stage, etc.) are no longer rendered inline — the new dashboard home
+	// uses HTMX-driven stats loading. The test now asserts auth-redirect behavior.
 	srv := New(&fakeStore{}, fakeAuth{}, 0, WithSyncStatusProvider(staticStatus{status: dashboard.SyncStatus{
 		Phase:         "degraded",
 		ReasonCode:    "auth_required",
@@ -134,13 +153,14 @@ func TestHandlerMountsDashboardAndHealth(t *testing.T) {
 		t.Fatalf("expected /health=200, got %d", health.Code)
 	}
 
+	// Unauthenticated request redirects to login.
 	dashboardRec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(dashboardRec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
-	if dashboardRec.Code != http.StatusOK {
-		t.Fatalf("expected /dashboard=200, got %d", dashboardRec.Code)
+	if dashboardRec.Code != http.StatusSeeOther {
+		t.Fatalf("expected /dashboard redirect to login for unauthenticated request, got %d body=%q", dashboardRec.Code, dashboardRec.Body.String())
 	}
-	if !strings.Contains(dashboardRec.Body.String(), "reason_code: auth_required") {
-		t.Fatalf("expected dashboard to render reason parity, body=%q", dashboardRec.Body.String())
+	if loc := dashboardRec.Header().Get("Location"); !strings.Contains(loc, "/dashboard/login") {
+		t.Fatalf("expected redirect to /dashboard/login, got %q", loc)
 	}
 }
 
@@ -201,8 +221,8 @@ func TestHandlerReturnsUnauthorizedWhenAuthFails(t *testing.T) {
 	if dashboardRec.Code != http.StatusSeeOther {
 		t.Fatalf("expected /dashboard redirect to login, got %d", dashboardRec.Code)
 	}
-	if location := dashboardRec.Header().Get("Location"); location != "/dashboard/login" {
-		t.Fatalf("expected redirect location /dashboard/login, got %q", location)
+	if location := dashboardRec.Header().Get("Location"); location != "/dashboard/login?next=%2Fdashboard" {
+		t.Fatalf("expected redirect location with preserved next target, got %q", location)
 	}
 }
 
@@ -225,7 +245,8 @@ func TestHandlerDashboardLoginFlowSetsCookieForBrowserUse(t *testing.T) {
 	if loginPage.Code != http.StatusOK {
 		t.Fatalf("expected /dashboard/login=200, got %d", loginPage.Code)
 	}
-	if !strings.Contains(loginPage.Body.String(), "Dashboard Login") {
+	// UPDATED: new templ login page renders "Sign In" heading + "Engram Cloud" brand.
+	if !strings.Contains(loginPage.Body.String(), "Engram Cloud") || !strings.Contains(loginPage.Body.String(), "name=\"token\"") {
 		t.Fatalf("expected dashboard login page html, body=%q", loginPage.Body.String())
 	}
 
@@ -247,8 +268,8 @@ func TestHandlerDashboardLoginFlowSetsCookieForBrowserUse(t *testing.T) {
 	if login.Code != http.StatusSeeOther {
 		t.Fatalf("expected successful login redirect, got %d", login.Code)
 	}
-	if location := login.Header().Get("Location"); location != "/dashboard" {
-		t.Fatalf("expected redirect to /dashboard, got %q", location)
+	if location := login.Header().Get("Location"); location != "/dashboard/" {
+		t.Fatalf("expected redirect to /dashboard/, got %q", location)
 	}
 	cookies := login.Result().Cookies()
 	if len(cookies) == 0 {
@@ -385,8 +406,83 @@ func TestHandlerDashboardLoginFailsClosedWithoutSessionCodec(t *testing.T) {
 	if dashboard.Code != http.StatusSeeOther {
 		t.Fatalf("expected dashboard to reject raw bearer cookie fallback, got %d", dashboard.Code)
 	}
-	if location := dashboard.Header().Get("Location"); location != "/dashboard/login" {
-		t.Fatalf("expected redirect to /dashboard/login, got %q", location)
+	if location := dashboard.Header().Get("Location"); location != "/dashboard/login?next=%2Fdashboard" {
+		t.Fatalf("expected redirect to /dashboard/login with preserved next target, got %q", location)
+	}
+}
+
+func TestHandlerDashboardLoginBypassesInsecureModeWithoutSessionCodec(t *testing.T) {
+	srv := New(&fakeStore{}, nil, 0)
+
+	loginPage := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(loginPage, httptest.NewRequest(http.MethodGet, "/dashboard/login", nil))
+	if loginPage.Code != http.StatusSeeOther {
+		t.Fatalf("expected insecure login page to redirect to dashboard, got %d", loginPage.Code)
+	}
+	if location := loginPage.Header().Get("Location"); location != "/dashboard/" {
+		t.Fatalf("expected redirect to /dashboard/, got %q", location)
+	}
+
+	login := httptest.NewRecorder()
+	loginReq := httptest.NewRequest(http.MethodPost, "/dashboard/login", strings.NewReader(""))
+	loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	srv.Handler().ServeHTTP(login, loginReq)
+	if login.Code != http.StatusSeeOther {
+		t.Fatalf("expected insecure login submit to redirect, got %d body=%q", login.Code, login.Body.String())
+	}
+	if location := login.Header().Get("Location"); location != "/dashboard/" {
+		t.Fatalf("expected redirect to /dashboard/, got %q", location)
+	}
+
+	dashboardRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(dashboardRec, httptest.NewRequest(http.MethodGet, "/dashboard", nil))
+	if dashboardRec.Code != http.StatusOK {
+		t.Fatalf("expected insecure dashboard access to succeed, got %d body=%q", dashboardRec.Code, dashboardRec.Body.String())
+	}
+}
+
+func TestHandlerDashboardAdminTokenIsDisabledWhenAuthIsBypassed(t *testing.T) {
+	srv := New(&fakeStore{}, nil, 0, WithDashboardAdminToken("admin-token"))
+
+	admin := httptest.NewRecorder()
+	adminReq := httptest.NewRequest(http.MethodGet, "/dashboard/admin", nil)
+	srv.Handler().ServeHTTP(admin, adminReq)
+
+	if admin.Code != http.StatusForbidden {
+		t.Fatalf("expected admin dashboard to be forbidden in insecure no-auth mode, got %d body=%q", admin.Code, admin.Body.String())
+	}
+}
+
+func TestHandlerDashboardAdminTokenFlowEstablishesAdminSession(t *testing.T) {
+	authSvc, err := cloudauth.NewService(&cloudstore.CloudStore{}, strings.Repeat("x", 32))
+	if err != nil {
+		t.Fatalf("new auth service: %v", err)
+	}
+	authSvc.SetBearerToken("sync-token")
+	authSvc.SetDashboardSessionTokens([]string{"admin-token"})
+
+	srv := New(&fakeStore{}, authSvc, 0, WithDashboardAdminToken("admin-token"))
+
+	login := httptest.NewRecorder()
+	loginReq := httptest.NewRequest(http.MethodPost, "/dashboard/login", strings.NewReader("token=admin-token"))
+	loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	srv.Handler().ServeHTTP(login, loginReq)
+	if login.Code != http.StatusSeeOther {
+		t.Fatalf("expected successful login redirect, got %d body=%q", login.Code, login.Body.String())
+	}
+
+	admin := httptest.NewRecorder()
+	adminReq := httptest.NewRequest(http.MethodGet, "/dashboard/admin", nil)
+	for _, cookie := range login.Result().Cookies() {
+		adminReq.AddCookie(cookie)
+	}
+	srv.Handler().ServeHTTP(admin, adminReq)
+	if admin.Code != http.StatusOK {
+		t.Fatalf("expected admin dashboard request to succeed with admin credential session, got %d body=%q", admin.Code, admin.Body.String())
+	}
+	// UPDATED: new admin page uses AdminPage templ component which renders "Admin Overview".
+	if !strings.Contains(admin.Body.String(), "ADMIN SURFACE") {
+		t.Fatalf("expected admin page content, body=%q", admin.Body.String())
 	}
 }
 
@@ -426,6 +522,89 @@ func TestHandlerDashboardLoginUsesSignedSessionCookieWithAuthService(t *testing.
 	srv.Handler().ServeHTTP(dashboard, dashboardReq)
 	if dashboard.Code != http.StatusOK {
 		t.Fatalf("expected dashboard request with signed cookie to succeed, got %d", dashboard.Code)
+	}
+}
+
+func TestHandlerDashboardRouteOwnershipParity(t *testing.T) {
+	authSvc, err := cloudauth.NewService(&cloudstore.CloudStore{}, strings.Repeat("x", 32))
+	if err != nil {
+		t.Fatalf("new auth service: %v", err)
+	}
+	authSvc.SetBearerToken("secret-token")
+	srv := New(&fakeStore{}, authSvc, 0)
+
+	login := httptest.NewRecorder()
+	loginReq := httptest.NewRequest(http.MethodPost, "/dashboard/login", strings.NewReader("token=secret-token"))
+	loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	srv.Handler().ServeHTTP(login, loginReq)
+	if login.Code != http.StatusSeeOther {
+		t.Fatalf("expected successful login redirect, got %d", login.Code)
+	}
+
+	asset := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(asset, httptest.NewRequest(http.MethodGet, "/dashboard/static/styles.css", nil))
+	if asset.Code != http.StatusOK {
+		t.Fatalf("expected dashboard static route to be mounted, got %d", asset.Code)
+	}
+	if !strings.Contains(asset.Body.String(), ".shell-body") {
+		t.Fatalf("expected stylesheet body markers, body=%q", asset.Body.String())
+	}
+
+	shareable := httptest.NewRecorder()
+	shareableReq := httptest.NewRequest(http.MethodGet, "/dashboard/projects/proj-a?project=proj-a", nil)
+	for _, cookie := range login.Result().Cookies() {
+		shareableReq.AddCookie(cookie)
+	}
+	srv.Handler().ServeHTTP(shareable, shareableReq)
+	if shareable.Code != http.StatusOK {
+		t.Fatalf("expected shareable dashboard detail route to resolve, got %d body=%q", shareable.Code, shareable.Body.String())
+	}
+	// MIGRATED: handleProjectDetail now uses ProjectDetailPage templ (renders "PROJECT DETAIL"
+	// kicker + "proj-a" in breadcrumb, not "Project: proj-a" from old raw-HTML builder).
+	if !strings.Contains(shareable.Body.String(), "PROJECT DETAIL") || !strings.Contains(shareable.Body.String(), "proj-a") {
+		t.Fatalf("expected shareable project detail page content, body=%q", shareable.Body.String())
+	}
+
+	syncSrv := New(&fakeStore{}, fakeAuth{}, 0)
+	syncRec := httptest.NewRecorder()
+	syncPayload := bytes.NewBufferString(`{"project":"proj-a","created_by":"tester","data":{"sessions":[{"id":"s-1","directory":"/tmp/s-1"}]}}`)
+	syncSrv.Handler().ServeHTTP(syncRec, httptest.NewRequest(http.MethodPost, "/sync/push", syncPayload))
+	if syncRec.Code != http.StatusOK {
+		t.Fatalf("expected sync route ownership to remain intact after dashboard parity routes, got %d body=%q", syncRec.Code, syncRec.Body.String())
+	}
+}
+
+func TestHandlerDashboardLoginDoesNotAcceptBearerHeaderAsSession(t *testing.T) {
+	authSvc, err := cloudauth.NewService(&cloudstore.CloudStore{}, strings.Repeat("x", 32))
+	if err != nil {
+		t.Fatalf("new auth service: %v", err)
+	}
+	authSvc.SetBearerToken("secret-token")
+	authSvc.SetDashboardSessionTokens([]string{"admin-token"})
+	srv := New(&fakeStore{}, authSvc, 0)
+
+	loginPage := httptest.NewRecorder()
+	loginPageReq := httptest.NewRequest(http.MethodGet, "/dashboard/login", nil)
+	loginPageReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(loginPage, loginPageReq)
+	if loginPage.Code != http.StatusOK {
+		t.Fatalf("expected /dashboard/login to render form when only bearer header is present, got %d", loginPage.Code)
+	}
+
+	dashboard := httptest.NewRecorder()
+	dashboardReq := httptest.NewRequest(http.MethodGet, "/dashboard", nil)
+	dashboardReq.Header.Set("Authorization", "Bearer secret-token")
+	srv.Handler().ServeHTTP(dashboard, dashboardReq)
+	if dashboard.Code != http.StatusSeeOther {
+		t.Fatalf("expected /dashboard to require cookie-backed session, got %d", dashboard.Code)
+	}
+
+	admin := httptest.NewRecorder()
+	adminReq := httptest.NewRequest(http.MethodGet, "/dashboard/admin", nil)
+	adminReq.Header.Set("Authorization", "Bearer admin-token")
+	srv.Handler().ServeHTTP(admin, adminReq)
+	if admin.Code != http.StatusSeeOther {
+		t.Fatalf("expected /dashboard/admin to require cookie-backed admin session, got %d", admin.Code)
 	}
 }
 
@@ -491,6 +670,61 @@ func TestHandlerPushMapsChunkConflictTo409(t *testing.T) {
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/sync/push", body))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandlerPushValidationErrorsExposeMachineActionableClasses(t *testing.T) {
+	t.Run("missing project is blocked class", func(t *testing.T) {
+		srv := New(&fakeStore{}, fakeAuth{}, 0)
+		body := bytes.NewBufferString(`{"created_by":"tester","data":{"sessions":[{"id":"s-1","directory":"/tmp/s-1"}]}}`)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/sync/push", body))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d body=%q", rec.Code, rec.Body.String())
+		}
+		payload := decodeActionableError(t, rec)
+		if payload.ErrorClass != "blocked" {
+			t.Fatalf("expected blocked error_class, got %q", payload.ErrorClass)
+		}
+		if payload.ErrorCode != "upgrade_blocked_project_required" {
+			t.Fatalf("expected upgrade_blocked_project_required, got %q", payload.ErrorCode)
+		}
+	})
+
+	t.Run("invalid payload is repairable class", func(t *testing.T) {
+		srv := New(&fakeStore{}, fakeAuth{}, 0)
+		body := bytes.NewBufferString(`{"project":"proj-a","created_by":"tester","data":{"sessions":[{"id":"s-1"}]}}`)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/sync/push", body))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d body=%q", rec.Code, rec.Body.String())
+		}
+		payload := decodeActionableError(t, rec)
+		if payload.ErrorClass != "repairable" {
+			t.Fatalf("expected repairable error_class, got %q", payload.ErrorClass)
+		}
+		if payload.ErrorCode != "upgrade_repairable_payload_invalid" {
+			t.Fatalf("expected upgrade_repairable_payload_invalid, got %q", payload.ErrorCode)
+		}
+		if !strings.Contains(payload.Error, "sessions[0].directory is required") {
+			t.Fatalf("expected detailed validation error, got %q", payload.Error)
+		}
+	})
+}
+
+func TestHandlerProjectScopeForbiddenReturnsPolicyClassPayload(t *testing.T) {
+	srv := New(&fakeStore{}, fakeAuth{projectErr: errors.New("denied")}, 0)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/sync/pull?project=proj-a", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	payload := decodeActionableError(t, rec)
+	if payload.ErrorClass != "policy" {
+		t.Fatalf("expected policy class, got %q", payload.ErrorClass)
+	}
+	if payload.ErrorCode != "policy_forbidden" {
+		t.Fatalf("expected policy_forbidden error code, got %q", payload.ErrorCode)
 	}
 }
 
@@ -890,5 +1124,63 @@ func TestStartBindsConfiguredHost(t *testing.T) {
 				t.Fatalf("expected addr %q, got %q", tt.expected, gotAddr)
 			}
 		})
+	}
+}
+
+// fakeStoreWithPauseControl wraps fakeStore and adds IsProjectSyncEnabled.
+// Used to test the structural interface assertion in handlePushChunk.
+type fakeStoreWithPauseControl struct {
+	fakeStore
+	syncEnabled bool
+}
+
+func (s *fakeStoreWithPauseControl) IsProjectSyncEnabled(_ string) (bool, error) {
+	return s.syncEnabled, nil
+}
+
+// TestPushPathPauseEnforcement asserts that POST /sync/push returns 409 with
+// error_code=sync-paused when the project's sync is disabled. Satisfies REQ-109.
+func TestPushPathPauseEnforcement(t *testing.T) {
+	pausedStore := &fakeStoreWithPauseControl{
+		fakeStore:   fakeStore{},
+		syncEnabled: false,
+	}
+	srv := New(pausedStore, fakeAuth{}, 0)
+
+	body := bytes.NewBufferString(`{"project":"proj-paused","created_by":"agent","data":{"sessions":[],"observations":[],"prompts":[]}}`)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sync/push", body)
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for paused project, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "sync-paused") {
+		t.Fatalf("expected sync-paused in body, got %q", rec.Body.String())
+	}
+}
+
+// TestInsecureModeLoginRedirects asserts that GET /dashboard/login with auth==nil
+// returns 303 to /dashboard/ (login is a no-op in insecure mode). Satisfies REQ-110.
+func TestInsecureModeLoginRedirects(t *testing.T) {
+	// Create server with nil auth (insecure no-auth mode).
+	srv := &CloudServer{
+		store: &fakeStore{},
+		auth:  nil,
+		port:  0,
+		host:  defaultHost,
+		mux:   http.NewServeMux(),
+	}
+	srv.routes()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/login", nil)
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect in insecure mode, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != "/dashboard/" {
+		t.Fatalf("expected redirect to /dashboard/, got %q", loc)
 	}
 }

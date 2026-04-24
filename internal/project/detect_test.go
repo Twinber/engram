@@ -1,6 +1,7 @@
 package project
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -187,5 +188,313 @@ func TestDetectProject_GitRemoteCasing(t *testing.T) {
 	got := DetectProject(dir)
 	if got != "myrepo" {
 		t.Errorf("DetectProject uppercase remote name = %q; want %q", got, "myrepo")
+	}
+}
+
+// ─── DetectProjectFull tests (Batch 1 — REQ-300 through REQ-307) ──────────────
+
+// TestDetectProjectFull_Case1_Remote asserts Source=="git_remote" for a
+// t.TempDir git repo with remote origin URL (REQ-301).
+func TestDetectProjectFull_Case1_Remote(t *testing.T) {
+	dir := t.TempDir()
+	initGit(t, dir)
+	cmd := exec.Command("git", "-C", dir, "remote", "add", "origin",
+		"git@github.com:testuser/my-cool-repo.git")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, out)
+	}
+
+	res := DetectProjectFull(dir)
+
+	if res.Source != SourceGitRemote {
+		t.Errorf("Source = %q; want %q", res.Source, SourceGitRemote)
+	}
+	if res.Project != "my-cool-repo" {
+		t.Errorf("Project = %q; want %q", res.Project, "my-cool-repo")
+	}
+	if res.Path == "" {
+		t.Error("Path must be non-empty")
+	}
+	if res.Error != nil {
+		t.Errorf("unexpected error: %v", res.Error)
+	}
+}
+
+// TestDetectProjectFull_Case1_PathIsRepoRoot asserts that Case 1 (git_remote)
+// sets Path to the git repository root, not the input directory (JS2).
+// When called from a subdir of a remote-configured repo, Path should equal the
+// root — consistent with Case 2 behavior.
+func TestDetectProjectFull_Case1_PathIsRepoRoot(t *testing.T) {
+	root := t.TempDir()
+	initGit(t, root)
+	cmd := exec.Command("git", "-C", root, "remote", "add", "origin",
+		"git@github.com:testuser/root-repo.git")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, out)
+	}
+
+	// Call from a subdirectory.
+	subdir := filepath.Join(root, "src", "lib")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	res := DetectProjectFull(subdir)
+
+	if res.Source != SourceGitRemote {
+		t.Errorf("Source = %q; want %q", res.Source, SourceGitRemote)
+	}
+	// JS2: Path must be repo root, not subdir.
+	wantPath, _ := filepath.EvalSymlinks(root)
+	gotPath, _ := filepath.EvalSymlinks(res.Path)
+	if gotPath != wantPath {
+		t.Errorf("Case1 Path = %q; want repo root %q (JS2: consistent with Case2)", res.Path, root)
+	}
+}
+
+// TestDetectProjectFull_Case1_NoRemote asserts fallthrough to git_root source
+// when no origin remote exists (REQ-301 fallback).
+func TestDetectProjectFull_Case1_NoRemote(t *testing.T) {
+	dir := t.TempDir()
+	initGit(t, dir)
+
+	res := DetectProjectFull(dir)
+
+	if res.Source != SourceGitRoot {
+		t.Errorf("Source = %q; want %q", res.Source, SourceGitRoot)
+	}
+	if res.Project == "" {
+		t.Error("Project must not be empty when no remote is set")
+	}
+	if res.Error != nil {
+		t.Errorf("unexpected error: %v", res.Error)
+	}
+}
+
+// TestDetectProjectFull_Case2_Subdir asserts Source=="git_root", Path==ancestor_root,
+// from a subdirectory two levels deep inside a git repo (REQ-302).
+func TestDetectProjectFull_Case2_Subdir(t *testing.T) {
+	root := t.TempDir()
+	initGit(t, root)
+
+	subdir := filepath.Join(root, "a", "b")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	res := DetectProjectFull(subdir)
+
+	if res.Source != SourceGitRoot {
+		t.Errorf("Source = %q; want %q", res.Source, SourceGitRoot)
+	}
+	// Resolve symlinks for comparison — macOS /var → /private/var.
+	wantPath, _ := filepath.EvalSymlinks(root)
+	gotPath, _ := filepath.EvalSymlinks(res.Path)
+	if gotPath != wantPath {
+		t.Errorf("Path = %q; want %q", res.Path, root)
+	}
+	if res.Project == "" {
+		t.Error("Project must not be empty")
+	}
+	if res.Error != nil {
+		t.Errorf("unexpected error: %v", res.Error)
+	}
+}
+
+// TestDetectProjectFull_Case3_SingleChild asserts Source=="git_child",
+// Warning!="", Error==nil for a temp dir with exactly one git-repo subdirectory
+// (REQ-303).
+func TestDetectProjectFull_Case3_SingleChild(t *testing.T) {
+	parent := t.TempDir()
+	child := filepath.Join(parent, "my-child-repo")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initGit(t, child)
+
+	res := DetectProjectFull(parent)
+
+	if res.Source != SourceGitChild {
+		t.Errorf("Source = %q; want %q", res.Source, SourceGitChild)
+	}
+	if res.Warning == "" {
+		t.Error("Warning must be non-empty for git_child promotion")
+	}
+	if res.Error != nil {
+		t.Errorf("unexpected error: %v", res.Error)
+	}
+	if res.Project != "my-child-repo" {
+		t.Errorf("Project = %q; want %q", res.Project, "my-child-repo")
+	}
+}
+
+// TestDetectProjectFull_Case4_MultiChild asserts Error==ErrAmbiguousProject,
+// len(AvailableProjects)==2, Project=="" for two git-repo children (REQ-304).
+func TestDetectProjectFull_Case4_MultiChild(t *testing.T) {
+	parent := t.TempDir()
+	for _, name := range []string{"repo-alpha", "repo-beta"} {
+		child := filepath.Join(parent, name)
+		if err := os.MkdirAll(child, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		initGit(t, child)
+	}
+
+	res := DetectProjectFull(parent)
+
+	if !errors.Is(res.Error, ErrAmbiguousProject) {
+		t.Errorf("Error = %v; want ErrAmbiguousProject", res.Error)
+	}
+	if len(res.AvailableProjects) != 2 {
+		t.Errorf("AvailableProjects len = %d; want 2", len(res.AvailableProjects))
+	}
+	if res.Project != "" {
+		t.Errorf("Project = %q; want empty on ambiguous", res.Project)
+	}
+}
+
+// TestDetectProjectFull_Case5_Basename asserts Source=="dir_basename",
+// Project==filepath.Base(dir), Error==nil for a plain non-git dir (REQ-305).
+func TestDetectProjectFull_Case5_Basename(t *testing.T) {
+	parent := t.TempDir()
+	plain := filepath.Join(parent, "plain-dir")
+	if err := os.MkdirAll(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	res := DetectProjectFull(plain)
+
+	if res.Source != SourceDirBasename {
+		t.Errorf("Source = %q; want %q", res.Source, SourceDirBasename)
+	}
+	if res.Project != "plain-dir" {
+		t.Errorf("Project = %q; want %q", res.Project, "plain-dir")
+	}
+	if res.Error != nil {
+		t.Errorf("unexpected error: %v", res.Error)
+	}
+	if res.Warning != "" {
+		t.Errorf("Warning must be empty for dir_basename, got %q", res.Warning)
+	}
+}
+
+// TestChildScan_ShortCircuit asserts the scan stops after 2 repos (REQ-306).
+func TestChildScan_ShortCircuit(t *testing.T) {
+	parent := t.TempDir()
+	// Create 4 child repos — scan must short-circuit after 2.
+	for _, name := range []string{"repo1", "repo2", "repo3", "repo4"} {
+		child := filepath.Join(parent, name)
+		if err := os.MkdirAll(child, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		initGit(t, child)
+	}
+
+	res := DetectProjectFull(parent)
+
+	if !errors.Is(res.Error, ErrAmbiguousProject) {
+		t.Errorf("Error = %v; want ErrAmbiguousProject", res.Error)
+	}
+	// AvailableProjects length bounded — scan stopped early.
+	if len(res.AvailableProjects) < 2 {
+		t.Errorf("expected at least 2 available projects, got %d", len(res.AvailableProjects))
+	}
+}
+
+// TestChildScan_SkipNoise asserts node_modules and vendor are skipped (REQ-306).
+func TestChildScan_SkipNoise(t *testing.T) {
+	parent := t.TempDir()
+	// node_modules with .git inside — must NOT be counted.
+	nm := filepath.Join(parent, "node_modules")
+	if err := os.MkdirAll(nm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initGit(t, nm)
+	// One legitimate repo.
+	legit := filepath.Join(parent, "my-project")
+	if err := os.MkdirAll(legit, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initGit(t, legit)
+
+	res := DetectProjectFull(parent)
+
+	// Should auto-promote my-project as the single child.
+	if res.Source != SourceGitChild {
+		t.Errorf("Source = %q; want %q (node_modules should be skipped)", res.Source, SourceGitChild)
+	}
+	if res.Project != "my-project" {
+		t.Errorf("Project = %q; want %q", res.Project, "my-project")
+	}
+}
+
+// TestChildScan_SkipHidden asserts hidden directories are skipped (REQ-306).
+func TestChildScan_SkipHidden(t *testing.T) {
+	parent := t.TempDir()
+	// Hidden dir with .git inside — must NOT be counted.
+	hidden := filepath.Join(parent, ".hidden-repo")
+	if err := os.MkdirAll(hidden, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initGit(t, hidden)
+	// One visible repo.
+	visible := filepath.Join(parent, "visible-repo")
+	if err := os.MkdirAll(visible, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initGit(t, visible)
+
+	res := DetectProjectFull(parent)
+
+	if res.Source != SourceGitChild {
+		t.Errorf("Source = %q; want %q (hidden dirs should be skipped)", res.Source, SourceGitChild)
+	}
+	if res.Project != "visible-repo" {
+		t.Errorf("Project = %q; want %q", res.Project, "visible-repo")
+	}
+}
+
+// TestDetectProject_MatchesFull asserts DetectProject returns same as
+// DetectProjectFull.Project for non-ambiguous cases (REQ-307 backward-compat wrapper).
+func TestDetectProject_MatchesFull(t *testing.T) {
+	dir := t.TempDir()
+	initGit(t, dir)
+
+	full := DetectProjectFull(dir)
+	compat := DetectProject(dir)
+
+	// For non-ambiguous cases, the wrapper must match Full.Project.
+	if full.Error == nil && compat != full.Project {
+		t.Errorf("DetectProject = %q; DetectProjectFull.Project = %q; must be equal",
+			compat, full.Project)
+	}
+}
+
+// TestDetectProject_AmbiguousEmpty asserts DetectProject returns basename
+// (not empty) even on ambiguous cwd, maintaining CLI compat (REQ-307).
+func TestDetectProject_AmbiguousEmpty(t *testing.T) {
+	parent := t.TempDir()
+	for _, name := range []string{"repo-a", "repo-b"} {
+		child := filepath.Join(parent, name)
+		if err := os.MkdirAll(child, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		initGit(t, child)
+	}
+
+	// DetectProjectFull reports ambiguous — Project will be "".
+	full := DetectProjectFull(parent)
+	if !errors.Is(full.Error, ErrAmbiguousProject) {
+		t.Skipf("expected ambiguous; got source=%s err=%v", full.Source, full.Error)
+	}
+
+	// The design decision: on ambiguity, DetectProject returns basename fallback
+	// so CLI callers never see empty. We verify project != "" per design doc §9.
+	// NOTE: the spec says DetectProject returns full.Project; design says ambiguous
+	// populates Project with basename. Both are satisfied by DetectProjectFull
+	// setting Project=basename when ErrAmbiguousProject occurs.
+	got := DetectProject(parent)
+	if got == "" {
+		t.Error("DetectProject must not return empty string on ambiguous cwd")
 	}
 }

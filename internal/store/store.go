@@ -209,6 +209,74 @@ type SyncMutation struct {
 	AckedAt    *string `json:"acked_at,omitempty"`
 }
 
+const (
+	UpgradeStagePlanned           = "planned"
+	UpgradeStageDoctorReady       = "doctor_ready"
+	UpgradeStageDoctorBlocked     = "doctor_blocked"
+	UpgradeStageRepairApplied     = "repair_applied"
+	UpgradeStageBootstrapEnrolled = "bootstrap_enrolled"
+	UpgradeStageBootstrapPushed   = "bootstrap_pushed"
+	UpgradeStageBootstrapVerified = "bootstrap_verified"
+	UpgradeStageRolledBack        = "rolled_back"
+
+	UpgradeRepairClassNone       = "none"
+	UpgradeRepairClassReady      = "ready"
+	UpgradeRepairClassRepairable = "repairable"
+	UpgradeRepairClassBlocked    = "blocked"
+	UpgradeRepairClassPolicy     = "policy"
+)
+
+type CloudUpgradeSnapshot struct {
+	CloudConfigPresent bool   `json:"cloud_config_present"`
+	CloudConfigJSON    string `json:"cloud_config_json,omitempty"`
+	ProjectEnrolled    bool   `json:"project_enrolled"`
+}
+
+type CloudUpgradeState struct {
+	Project          string               `json:"project"`
+	Stage            string               `json:"stage"`
+	RepairClass      string               `json:"repair_class"`
+	Snapshot         CloudUpgradeSnapshot `json:"snapshot"`
+	LastErrorCode    string               `json:"last_error_code,omitempty"`
+	LastErrorMessage string               `json:"last_error_message,omitempty"`
+	FindingsJSON     string               `json:"findings_json,omitempty"`
+	AppliedActions   string               `json:"applied_actions,omitempty"`
+	UpdatedAt        string               `json:"updated_at"`
+}
+
+type CloudUpgradeRepairReport struct {
+	Class         string `json:"class"`
+	ReasonCode    string `json:"reason_code"`
+	Message       string `json:"message"`
+	PlannedAction string `json:"planned_action,omitempty"`
+	Applied       bool   `json:"applied"`
+}
+
+type CloudUpgradeLegacyMutationFinding struct {
+	Seq        int64  `json:"seq"`
+	Entity     string `json:"entity"`
+	Op         string `json:"op"`
+	ReasonCode string `json:"reason_code"`
+	Message    string `json:"message"`
+	Repairable bool   `json:"repairable"`
+	RepairHint string `json:"repair_hint,omitempty"`
+	EntityKey  string `json:"entity_key,omitempty"`
+	TargetKey  string `json:"target_key,omitempty"`
+	Project    string `json:"project,omitempty"`
+}
+
+type CloudUpgradeLegacyMutationReport struct {
+	Project         string                              `json:"project"`
+	RepairableCount int                                 `json:"repairable_count"`
+	BlockedCount    int                                 `json:"blocked_count"`
+	Findings        []CloudUpgradeLegacyMutationFinding `json:"findings,omitempty"`
+}
+
+const (
+	UpgradeReasonRepairableLegacyMutationPayload = "upgrade_repairable_legacy_mutation_payload"
+	UpgradeReasonBlockedLegacyMutationManual     = "upgrade_blocked_legacy_mutation_manual"
+)
+
 // EnrolledProject represents a project enrolled for cloud sync.
 type EnrolledProject struct {
 	Project    string `json:"project"`
@@ -573,6 +641,18 @@ func (s *Store) migrate() error {
 				acked_at    TEXT,
 				FOREIGN KEY (target_key) REFERENCES sync_state(target_key)
 			);
+
+			CREATE TABLE IF NOT EXISTS cloud_upgrade_state (
+				project            TEXT PRIMARY KEY,
+				stage              TEXT NOT NULL DEFAULT 'planned',
+				repair_class       TEXT NOT NULL DEFAULT 'none',
+				snapshot_json      TEXT NOT NULL DEFAULT '{}',
+				last_error_code    TEXT,
+				last_error_message TEXT,
+				findings_json      TEXT,
+				applied_actions    TEXT,
+				updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+			);
 		`
 	if _, err := s.execHook(s.db, schema); err != nil {
 		return err
@@ -695,6 +775,11 @@ func (s *Store) migrate() error {
 	if _, err := s.execHook(s.db, `INSERT OR IGNORE INTO sync_state (target_key, lifecycle, updated_at) VALUES ('cloud', 'idle', datetime('now'))`); err != nil {
 		return err
 	}
+	if _, err := s.execHook(s.db, `
+		CREATE INDEX IF NOT EXISTS idx_cloud_upgrade_state_stage ON cloud_upgrade_state(stage);
+	`); err != nil {
+		return err
+	}
 
 	// Create triggers to keep FTS in sync (idempotent check)
 	var name string
@@ -761,6 +846,677 @@ func (s *Store) migrate() error {
 	}
 
 	return nil
+}
+
+func (s *Store) SaveCloudUpgradeState(state CloudUpgradeState) error {
+	project, _ := NormalizeProject(state.Project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return fmt.Errorf("cloud upgrade project must not be empty")
+	}
+	state.Project = project
+	state.Stage = normalizeUpgradeStage(state.Stage)
+	state.RepairClass = normalizeUpgradeRepairClass(state.RepairClass)
+
+	snapshotJSON, err := json.Marshal(state.Snapshot)
+	if err != nil {
+		return fmt.Errorf("marshal cloud upgrade snapshot: %w", err)
+	}
+
+	_, err = s.execHook(s.db, `
+		INSERT INTO cloud_upgrade_state (
+			project, stage, repair_class, snapshot_json, last_error_code, last_error_message, findings_json, applied_actions, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+		ON CONFLICT(project) DO UPDATE SET
+			stage = excluded.stage,
+			repair_class = excluded.repair_class,
+			snapshot_json = excluded.snapshot_json,
+			last_error_code = excluded.last_error_code,
+			last_error_message = excluded.last_error_message,
+			findings_json = excluded.findings_json,
+			applied_actions = excluded.applied_actions,
+			updated_at = datetime('now')
+	`, state.Project, state.Stage, state.RepairClass, string(snapshotJSON), nullableString(state.LastErrorCode), nullableString(state.LastErrorMessage), nullableString(state.FindingsJSON), nullableString(state.AppliedActions))
+	return err
+}
+
+func (s *Store) GetCloudUpgradeState(project string) (*CloudUpgradeState, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil, nil
+	}
+
+	row := s.db.QueryRow(`
+		SELECT project, stage, repair_class, snapshot_json, ifnull(last_error_code, ''), ifnull(last_error_message, ''), ifnull(findings_json, ''), ifnull(applied_actions, ''), updated_at
+		FROM cloud_upgrade_state
+		WHERE project = ?
+	`, project)
+
+	var state CloudUpgradeState
+	var snapshotJSON string
+	if err := row.Scan(&state.Project, &state.Stage, &state.RepairClass, &snapshotJSON, &state.LastErrorCode, &state.LastErrorMessage, &state.FindingsJSON, &state.AppliedActions, &state.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if strings.TrimSpace(snapshotJSON) != "" {
+		if err := json.Unmarshal([]byte(snapshotJSON), &state.Snapshot); err != nil {
+			return nil, fmt.Errorf("parse cloud upgrade snapshot: %w", err)
+		}
+	}
+	state.Stage = normalizeUpgradeStage(state.Stage)
+	state.RepairClass = normalizeUpgradeRepairClass(state.RepairClass)
+	return &state, nil
+}
+
+func (s *Store) ClearCloudUpgradeState(project string) error {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil
+	}
+	_, err := s.execHook(s.db, `DELETE FROM cloud_upgrade_state WHERE project = ?`, project)
+	return err
+}
+
+func (s *Store) CanRollbackCloudUpgrade(project string) (bool, error) {
+	state, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		return false, err
+	}
+	if state == nil {
+		return false, nil
+	}
+	return state.Stage != UpgradeStageBootstrapVerified, nil
+}
+
+func (s *Store) RollbackCloudUpgrade(project string) (CloudUpgradeState, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return CloudUpgradeState{}, fmt.Errorf("cloud upgrade rollback requires project")
+	}
+
+	state, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		return CloudUpgradeState{}, fmt.Errorf("read cloud upgrade rollback state: %w", err)
+	}
+	if state == nil {
+		return CloudUpgradeState{}, fmt.Errorf("rollback requires existing upgrade checkpoint state")
+	}
+	if state.Stage == UpgradeStageBootstrapVerified {
+		return CloudUpgradeState{}, fmt.Errorf("rollback is unavailable post-bootstrap; use explicit disconnect/unenroll flows")
+	}
+
+	if state.Snapshot.ProjectEnrolled {
+		if err := s.EnrollProject(project); err != nil {
+			return CloudUpgradeState{}, fmt.Errorf("restore project enrollment from rollback snapshot: %w", err)
+		}
+	} else {
+		if err := s.UnenrollProject(project); err != nil {
+			return CloudUpgradeState{}, fmt.Errorf("restore project unenrollment from rollback snapshot: %w", err)
+		}
+	}
+
+	state.Stage = UpgradeStageRolledBack
+	state.LastErrorCode = ""
+	state.LastErrorMessage = ""
+	state.FindingsJSON = ""
+	state.AppliedActions = ""
+	if err := s.SaveCloudUpgradeState(*state); err != nil {
+		return CloudUpgradeState{}, fmt.Errorf("persist rolled back upgrade state: %w", err)
+	}
+
+	rolledBack, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		return CloudUpgradeState{}, fmt.Errorf("load rolled back cloud upgrade state: %w", err)
+	}
+	if rolledBack == nil {
+		return CloudUpgradeState{}, fmt.Errorf("rolled back cloud upgrade state not found")
+	}
+	return *rolledBack, nil
+}
+
+func (s *Store) RepairCloudUpgrade(project string, apply bool) (CloudUpgradeRepairReport, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return CloudUpgradeRepairReport{
+			Class:      UpgradeRepairClassBlocked,
+			ReasonCode: "upgrade_blocked_project_required",
+			Message:    "project is required for cloud upgrade repair",
+		}, nil
+	}
+
+	if blocked, report, err := s.cloudUpgradeManualActionReport(project); err != nil {
+		return CloudUpgradeRepairReport{}, err
+	} else if blocked {
+		return report, nil
+	}
+
+	enrolled, err := s.IsProjectEnrolled(project)
+	if err != nil {
+		return CloudUpgradeRepairReport{}, fmt.Errorf("check project enrollment: %w", err)
+	}
+	if !enrolled {
+		return CloudUpgradeRepairReport{
+			Class:      UpgradeRepairClassBlocked,
+			ReasonCode: "upgrade_blocked_manual",
+			Message:    fmt.Sprintf("project %q is not enrolled; run doctor/bootstrap guidance first", project),
+		}, nil
+	}
+
+	legacyReport, err := s.DiagnoseCloudUpgradeLegacyMutations(project)
+	if err != nil {
+		return CloudUpgradeRepairReport{}, fmt.Errorf("diagnose legacy cloud upgrade mutations: %w", err)
+	}
+	if legacyReport.BlockedCount > 0 {
+		first := legacyReport.Findings[0]
+		return CloudUpgradeRepairReport{
+			Class:      UpgradeRepairClassBlocked,
+			ReasonCode: UpgradeReasonBlockedLegacyMutationManual,
+			Message:    fmt.Sprintf("manual-action-required: %s (seq=%d entity=%s op=%s)", first.Message, first.Seq, first.Entity, first.Op),
+			Applied:    false,
+		}, nil
+	}
+	if legacyReport.RepairableCount > 0 {
+		report := CloudUpgradeRepairReport{
+			Class:         UpgradeRepairClassRepairable,
+			ReasonCode:    UpgradeReasonRepairableLegacyMutationPayload,
+			Message:       fmt.Sprintf("project %q has %d repairable legacy mutation payload issue(s)", project, legacyReport.RepairableCount),
+			PlannedAction: "repair_legacy_mutation_payloads",
+			Applied:       false,
+		}
+		if !apply {
+			return report, nil
+		}
+		if err := s.applyCloudUpgradeLegacyMutationRepairs(project); err != nil {
+			return CloudUpgradeRepairReport{}, fmt.Errorf("apply cloud upgrade legacy mutation repairs: %w", err)
+		}
+		report.Applied = true
+		report.Message = fmt.Sprintf("applied deterministic legacy mutation payload repairs for project %q", project)
+		_ = s.SaveCloudUpgradeState(CloudUpgradeState{
+			Project:     project,
+			Stage:       UpgradeStageRepairApplied,
+			RepairClass: UpgradeRepairClassRepairable,
+		})
+		return report, nil
+	}
+
+	requiresBackfill, err := s.projectSyncBackfillRequired(project)
+	if err != nil {
+		return CloudUpgradeRepairReport{}, err
+	}
+	if !requiresBackfill {
+		return CloudUpgradeRepairReport{
+			Class:      UpgradeRepairClassReady,
+			ReasonCode: "upgrade_repair_noop",
+			Message:    fmt.Sprintf("project %q has no deterministic local repairs to apply", project),
+		}, nil
+	}
+
+	report := CloudUpgradeRepairReport{
+		Class:         UpgradeRepairClassRepairable,
+		ReasonCode:    "upgrade_repair_backfill_sync_journal",
+		Message:       fmt.Sprintf("project %q has deterministic local sync metadata gaps", project),
+		PlannedAction: "backfill_sync_journal",
+		Applied:       false,
+	}
+	if !apply {
+		return report, nil
+	}
+
+	if err := s.withTx(func(tx *sql.Tx) error {
+		return s.backfillProjectSyncMutationsTx(tx, project)
+	}); err != nil {
+		return CloudUpgradeRepairReport{}, fmt.Errorf("apply cloud upgrade repair: %w", err)
+	}
+	report.Applied = true
+	_ = s.SaveCloudUpgradeState(CloudUpgradeState{
+		Project:     project,
+		Stage:       UpgradeStageRepairApplied,
+		RepairClass: UpgradeRepairClassRepairable,
+	})
+	return report, nil
+}
+
+type cloudUpgradeLegacyMutationEvaluation struct {
+	finding         CloudUpgradeLegacyMutationFinding
+	hasIssue        bool
+	repairedPayload string
+	canRepair       bool
+}
+
+func (s *Store) DiagnoseCloudUpgradeLegacyMutations(project string) (CloudUpgradeLegacyMutationReport, error) {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return CloudUpgradeLegacyMutationReport{Project: project}, nil
+	}
+
+	evaluations, err := s.evaluateCloudUpgradeLegacyMutations(project)
+	if err != nil {
+		return CloudUpgradeLegacyMutationReport{}, err
+	}
+	report := CloudUpgradeLegacyMutationReport{Project: project}
+	for _, eval := range evaluations {
+		if !eval.hasIssue {
+			continue
+		}
+		report.Findings = append(report.Findings, eval.finding)
+		if eval.canRepair {
+			report.RepairableCount++
+		} else {
+			report.BlockedCount++
+		}
+	}
+	return report, nil
+}
+
+func (s *Store) applyCloudUpgradeLegacyMutationRepairs(project string) error {
+	project, _ = NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil
+	}
+	return s.withTx(func(tx *sql.Tx) error {
+		mutations, err := s.listPendingProjectMutationsTx(tx, project)
+		if err != nil {
+			return err
+		}
+		for _, mutation := range mutations {
+			eval, err := s.evaluateCloudUpgradeLegacyMutationTx(tx, mutation)
+			if err != nil {
+				return err
+			}
+			if !eval.hasIssue || !eval.canRepair || strings.TrimSpace(eval.repairedPayload) == "" {
+				continue
+			}
+			if _, err := s.execHook(tx,
+				`UPDATE sync_mutations SET payload = ? WHERE target_key = ? AND project = ? AND seq = ? AND acked_at IS NULL`,
+				eval.repairedPayload,
+				DefaultSyncTargetKey,
+				project,
+				mutation.Seq,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Store) evaluateCloudUpgradeLegacyMutations(project string) ([]cloudUpgradeLegacyMutationEvaluation, error) {
+	return s.withReadTx(func(tx *sql.Tx) ([]cloudUpgradeLegacyMutationEvaluation, error) {
+		mutations, err := s.listPendingProjectMutationsTx(tx, project)
+		if err != nil {
+			return nil, err
+		}
+		evaluations := make([]cloudUpgradeLegacyMutationEvaluation, 0, len(mutations))
+		for _, mutation := range mutations {
+			eval, err := s.evaluateCloudUpgradeLegacyMutationTx(tx, mutation)
+			if err != nil {
+				return nil, err
+			}
+			evaluations = append(evaluations, eval)
+		}
+		return evaluations, nil
+	})
+}
+
+func (s *Store) withReadTx(fn func(tx *sql.Tx) ([]cloudUpgradeLegacyMutationEvaluation, error)) ([]cloudUpgradeLegacyMutationEvaluation, error) {
+	tx, err := s.beginTxHook()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	return fn(tx)
+}
+
+func (s *Store) listPendingProjectMutationsTx(tx *sql.Tx, project string) ([]SyncMutation, error) {
+	rows, err := s.queryItHook(tx, `
+		SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at
+		FROM sync_mutations
+		WHERE target_key = ? AND project = ? AND acked_at IS NULL
+		ORDER BY seq ASC
+	`, DefaultSyncTargetKey, project)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	mutations := make([]SyncMutation, 0)
+	for rows.Next() {
+		var m SyncMutation
+		if err := rows.Scan(&m.Seq, &m.TargetKey, &m.Entity, &m.EntityKey, &m.Op, &m.Payload, &m.Source, &m.Project, &m.OccurredAt, &m.AckedAt); err != nil {
+			return nil, err
+		}
+		mutations = append(mutations, m)
+	}
+	return mutations, rows.Err()
+}
+
+func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMutation) (cloudUpgradeLegacyMutationEvaluation, error) {
+	entity := strings.TrimSpace(mutation.Entity)
+	op := strings.TrimSpace(mutation.Op)
+	payload := strings.TrimSpace(mutation.Payload)
+	base := CloudUpgradeLegacyMutationFinding{
+		Seq:       mutation.Seq,
+		Entity:    entity,
+		Op:        op,
+		EntityKey: strings.TrimSpace(mutation.EntityKey),
+		TargetKey: strings.TrimSpace(mutation.TargetKey),
+		Project:   strings.TrimSpace(mutation.Project),
+	}
+
+	repairable := func(msg, hint string, repairedPayload string) cloudUpgradeLegacyMutationEvaluation {
+		finding := base
+		finding.Repairable = true
+		finding.ReasonCode = UpgradeReasonRepairableLegacyMutationPayload
+		finding.Message = msg
+		finding.RepairHint = hint
+		return cloudUpgradeLegacyMutationEvaluation{finding: finding, hasIssue: true, canRepair: true, repairedPayload: repairedPayload}
+	}
+	blocked := func(code, msg string) cloudUpgradeLegacyMutationEvaluation {
+		finding := base
+		finding.Repairable = false
+		finding.ReasonCode = code
+		finding.Message = msg
+		return cloudUpgradeLegacyMutationEvaluation{finding: finding, hasIssue: true, canRepair: false}
+	}
+
+	if payload == "" {
+		return blocked(UpgradeReasonBlockedLegacyMutationManual, "legacy mutation payload is empty"), nil
+	}
+
+	supported := (entity == SyncEntitySession && op == SyncOpUpsert) ||
+		((entity == SyncEntityObservation || entity == SyncEntityPrompt) && (op == SyncOpUpsert || op == SyncOpDelete))
+	if !supported {
+		return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("unsupported legacy mutation %q/%q", entity, op)), nil
+	}
+
+	switch entity {
+	case SyncEntitySession:
+		var body syncSessionPayload
+		if err := decodeSyncPayload([]byte(payload), &body); err != nil {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("decode session payload: %v", err)), nil
+		}
+		body.ID = strings.TrimSpace(body.ID)
+		body.Directory = strings.TrimSpace(body.Directory)
+		changed := false
+		if body.ID == "" && strings.TrimSpace(mutation.EntityKey) != "" {
+			body.ID = strings.TrimSpace(mutation.EntityKey)
+			changed = true
+		}
+		if body.ID == "" {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, "session payload id is required"), nil
+		}
+		if strings.TrimSpace(mutation.EntityKey) != "" && strings.TrimSpace(mutation.EntityKey) != body.ID {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("session entity_key %q does not match payload id %q", mutation.EntityKey, body.ID)), nil
+		}
+		if body.Directory == "" {
+			var directory string
+			err := tx.QueryRow(`SELECT ifnull(directory, '') FROM sessions WHERE id = ?`, body.ID).Scan(&directory)
+			if errors.Is(err, sql.ErrNoRows) || strings.TrimSpace(directory) == "" {
+				return blocked(UpgradeReasonBlockedLegacyMutationManual, "session payload directory is required and cannot be inferred from local state"), nil
+			}
+			if err != nil {
+				return cloudUpgradeLegacyMutationEvaluation{}, err
+			}
+			body.Directory = strings.TrimSpace(directory)
+			changed = true
+		}
+		if !changed {
+			return cloudUpgradeLegacyMutationEvaluation{}, nil
+		}
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return cloudUpgradeLegacyMutationEvaluation{}, err
+		}
+		return repairable("session payload is missing required upsert fields", "repair fills session id/directory from local sessions table", string(encoded)), nil
+
+	case SyncEntityObservation:
+		var body syncObservationPayload
+		if err := decodeSyncPayload([]byte(payload), &body); err != nil {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("decode observation payload: %v", err)), nil
+		}
+		body.SyncID = strings.TrimSpace(body.SyncID)
+		body.SessionID = strings.TrimSpace(body.SessionID)
+		body.Type = strings.TrimSpace(body.Type)
+		body.Title = strings.TrimSpace(body.Title)
+		body.Content = strings.TrimSpace(body.Content)
+		body.Scope = strings.TrimSpace(body.Scope)
+		changed := false
+		if body.SyncID == "" && strings.TrimSpace(mutation.EntityKey) != "" {
+			body.SyncID = strings.TrimSpace(mutation.EntityKey)
+			changed = true
+		}
+		if body.SyncID == "" {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, "observation payload sync_id is required"), nil
+		}
+		if strings.TrimSpace(mutation.EntityKey) != "" && strings.TrimSpace(mutation.EntityKey) != body.SyncID {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("observation entity_key %q does not match payload sync_id %q", mutation.EntityKey, body.SyncID)), nil
+		}
+		if op == SyncOpUpsert {
+			obs, err := s.getObservationBySyncIDTx(tx, body.SyncID, true)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return cloudUpgradeLegacyMutationEvaluation{}, err
+			}
+			if strings.TrimSpace(body.SessionID) == "" && obs != nil && strings.TrimSpace(obs.SessionID) != "" {
+				body.SessionID = strings.TrimSpace(obs.SessionID)
+				changed = true
+			}
+			if strings.TrimSpace(body.Type) == "" && obs != nil && strings.TrimSpace(obs.Type) != "" {
+				body.Type = strings.TrimSpace(obs.Type)
+				changed = true
+			}
+			if strings.TrimSpace(body.Title) == "" && obs != nil && strings.TrimSpace(obs.Title) != "" {
+				body.Title = strings.TrimSpace(obs.Title)
+				changed = true
+			}
+			if strings.TrimSpace(body.Content) == "" && obs != nil && strings.TrimSpace(obs.Content) != "" {
+				body.Content = strings.TrimSpace(obs.Content)
+				changed = true
+			}
+			if strings.TrimSpace(body.Scope) == "" && obs != nil && strings.TrimSpace(obs.Scope) != "" {
+				body.Scope = strings.TrimSpace(obs.Scope)
+				changed = true
+			}
+			missing := []string{}
+			if strings.TrimSpace(body.SessionID) == "" {
+				missing = append(missing, "session_id")
+			}
+			if strings.TrimSpace(body.Type) == "" {
+				missing = append(missing, "type")
+			}
+			if strings.TrimSpace(body.Title) == "" {
+				missing = append(missing, "title")
+			}
+			if strings.TrimSpace(body.Content) == "" {
+				missing = append(missing, "content")
+			}
+			if strings.TrimSpace(body.Scope) == "" {
+				missing = append(missing, "scope")
+			}
+			if len(missing) > 0 {
+				return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("observation payload missing required upsert fields: %s", strings.Join(missing, ", "))), nil
+			}
+		}
+		if !changed {
+			return cloudUpgradeLegacyMutationEvaluation{}, nil
+		}
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return cloudUpgradeLegacyMutationEvaluation{}, err
+		}
+		return repairable("observation payload is missing required fields for canonical bootstrap", "repair fills missing observation fields from local observations table", string(encoded)), nil
+
+	case SyncEntityPrompt:
+		var body syncPromptPayload
+		if err := decodeSyncPayload([]byte(payload), &body); err != nil {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("decode prompt payload: %v", err)), nil
+		}
+		body.SyncID = strings.TrimSpace(body.SyncID)
+		body.SessionID = strings.TrimSpace(body.SessionID)
+		body.Content = strings.TrimSpace(body.Content)
+		changed := false
+		if body.SyncID == "" && strings.TrimSpace(mutation.EntityKey) != "" {
+			body.SyncID = strings.TrimSpace(mutation.EntityKey)
+			changed = true
+		}
+		if body.SyncID == "" {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, "prompt payload sync_id is required"), nil
+		}
+		if strings.TrimSpace(mutation.EntityKey) != "" && strings.TrimSpace(mutation.EntityKey) != body.SyncID {
+			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("prompt entity_key %q does not match payload sync_id %q", mutation.EntityKey, body.SyncID)), nil
+		}
+		if op == SyncOpUpsert {
+			var local syncPromptPayload
+			err := tx.QueryRow(
+				`SELECT sync_id, session_id, content, project, created_at FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`,
+				body.SyncID,
+			).Scan(&local.SyncID, &local.SessionID, &local.Content, &local.Project, &local.CreatedAt)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return cloudUpgradeLegacyMutationEvaluation{}, err
+			}
+			if strings.TrimSpace(body.SessionID) == "" && err == nil && strings.TrimSpace(local.SessionID) != "" {
+				body.SessionID = strings.TrimSpace(local.SessionID)
+				changed = true
+			}
+			if strings.TrimSpace(body.Content) == "" && err == nil && strings.TrimSpace(local.Content) != "" {
+				body.Content = strings.TrimSpace(local.Content)
+				changed = true
+			}
+			missing := []string{}
+			if strings.TrimSpace(body.SessionID) == "" {
+				missing = append(missing, "session_id")
+			}
+			if strings.TrimSpace(body.Content) == "" {
+				missing = append(missing, "content")
+			}
+			if len(missing) > 0 {
+				return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("prompt payload missing required upsert fields: %s", strings.Join(missing, ", "))), nil
+			}
+		}
+		if !changed {
+			return cloudUpgradeLegacyMutationEvaluation{}, nil
+		}
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return cloudUpgradeLegacyMutationEvaluation{}, err
+		}
+		return repairable("prompt payload is missing required fields for canonical bootstrap", "repair fills missing prompt fields from local prompts table", string(encoded)), nil
+	}
+
+	return cloudUpgradeLegacyMutationEvaluation{}, nil
+}
+
+func (s *Store) cloudUpgradeManualActionReport(project string) (bool, CloudUpgradeRepairReport, error) {
+	targetKey := DefaultSyncTargetKey
+	if project != "" {
+		targetKey = fmt.Sprintf("%s:%s", DefaultSyncTargetKey, project)
+	}
+	state, err := s.GetSyncState(targetKey)
+	if err != nil {
+		return false, CloudUpgradeRepairReport{}, fmt.Errorf("read sync state for cloud upgrade repair: %w", err)
+	}
+	if state == nil {
+		return false, CloudUpgradeRepairReport{}, nil
+	}
+	reasonCode := strings.TrimSpace(derefString(state.ReasonCode))
+	if reasonCode == "" {
+		return false, CloudUpgradeRepairReport{}, nil
+	}
+
+	reasonMap := map[string]string{
+		"auth_required":      "upgrade_policy_auth_required",
+		"policy_forbidden":   "upgrade_policy_forbidden",
+		"cloud_config_error": "upgrade_policy_cloud_config_error",
+	}
+	repairReasonCode, requiresManualAction := reasonMap[reasonCode]
+	if !requiresManualAction {
+		return false, CloudUpgradeRepairReport{}, nil
+	}
+	reasonMessage := strings.TrimSpace(derefString(state.ReasonMessage))
+	if reasonMessage == "" {
+		reasonMessage = "cloud policy/auth precondition must be resolved before repair"
+	}
+	return true, CloudUpgradeRepairReport{
+		Class:      UpgradeRepairClassPolicy,
+		ReasonCode: repairReasonCode,
+		Message:    fmt.Sprintf("manual-action-required: %s", reasonMessage),
+		Applied:    false,
+	}, nil
+}
+
+func (s *Store) projectSyncBackfillRequired(project string) (bool, error) {
+	var missing int
+	err := s.db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1
+			FROM sessions sess
+			WHERE sess.project = ?
+			  AND NOT EXISTS (
+				SELECT 1 FROM sync_mutations sm
+				WHERE sm.target_key = ?
+				  AND sm.entity = ?
+				  AND sm.entity_key = sess.id
+				  AND sm.source = ?
+			  )
+			UNION ALL
+			SELECT 1
+			FROM observations obs
+			LEFT JOIN sessions sess ON sess.id = obs.session_id
+			WHERE (
+				ifnull(obs.project, '') = ?
+				OR (ifnull(obs.project, '') = '' AND ifnull(sess.project, '') = ?)
+			)
+			  AND obs.deleted_at IS NULL
+			  AND NOT EXISTS (
+				SELECT 1 FROM sync_mutations sm
+				WHERE sm.target_key = ?
+				  AND sm.entity = ?
+				  AND sm.entity_key = obs.sync_id
+				  AND sm.source = ?
+			  )
+		)
+	`, project, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal, project, project, DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal).Scan(&missing)
+	if err != nil {
+		return false, fmt.Errorf("detect project sync metadata gaps: %w", err)
+	}
+	return missing == 1, nil
+}
+
+func normalizeUpgradeStage(stage string) string {
+	stage = strings.TrimSpace(strings.ToLower(stage))
+	switch stage {
+	case UpgradeStagePlanned,
+		UpgradeStageDoctorReady,
+		UpgradeStageDoctorBlocked,
+		UpgradeStageRepairApplied,
+		UpgradeStageBootstrapEnrolled,
+		UpgradeStageBootstrapPushed,
+		UpgradeStageBootstrapVerified,
+		UpgradeStageRolledBack:
+		return stage
+	default:
+		return UpgradeStagePlanned
+	}
+}
+
+func normalizeUpgradeRepairClass(class string) string {
+	class = strings.TrimSpace(strings.ToLower(class))
+	switch class {
+	case UpgradeRepairClassNone,
+		UpgradeRepairClassReady,
+		UpgradeRepairClassRepairable,
+		UpgradeRepairClassBlocked,
+		UpgradeRepairClassPolicy:
+		return class
+	default:
+		return UpgradeRepairClassNone
+	}
 }
 
 func (s *Store) migrateFTSTopicKey() error {
@@ -1806,6 +2562,35 @@ func (s *Store) Stats() (*Stats, error) {
 	}
 
 	return stats, nil
+}
+
+// ─── Project Existence ───────────────────────────────────────────────────────
+
+// ProjectExists returns true if the named project has at least one record in
+// any of observations, sessions, prompts, or enrollment tables.
+// Uses a single UNION ALL LIMIT 1 query for efficiency (REQ-315).
+// The sync_enrolled_projects branch ensures a project enrolled via EnrollProject()
+// without any other data is still recognized (JC1).
+func (s *Store) ProjectExists(name string) (bool, error) {
+	const query = `
+SELECT 1 FROM (
+  SELECT project FROM observations WHERE project = ? AND deleted_at IS NULL
+  UNION ALL
+  SELECT project FROM sessions WHERE project = ?
+  UNION ALL
+  SELECT project FROM user_prompts WHERE project = ?
+  UNION ALL
+  SELECT project FROM sync_enrolled_projects WHERE project = ?
+) LIMIT 1`
+	var dummy int
+	err := s.db.QueryRow(query, name, name, name, name).Scan(&dummy)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // ─── Context Formatting ─────────────────────────────────────────────────────

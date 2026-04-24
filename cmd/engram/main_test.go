@@ -13,6 +13,7 @@ import (
 	"github.com/Gentleman-Programming/engram/internal/mcp"
 	"github.com/Gentleman-Programming/engram/internal/obsidian"
 	"github.com/Gentleman-Programming/engram/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
 	versioncheck "github.com/Gentleman-Programming/engram/internal/version"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 )
@@ -173,6 +174,19 @@ func TestPrintUsage(t *testing.T) {
 	if !strings.Contains(stdout, "Required for cloud serve in BOTH token auth and insecure no-auth mode") {
 		t.Fatalf("usage missing updated ENGRAM_CLOUD_ALLOWED_PROJECTS contract: %q", stdout)
 	}
+	for _, token := range []string{
+		"ENGRAM_DATABASE_URL",
+		"ENGRAM_CLOUD_HOST",
+		"ENGRAM_CLOUD_TOKEN",
+		"ENGRAM_CLOUD_INSECURE_NO_AUTH",
+		"Cannot be combined with ENGRAM_CLOUD_TOKEN",
+		"Cannot be combined with ENGRAM_CLOUD_ADMIN",
+		"ENGRAM_CLOUD_ADMIN",
+	} {
+		if !strings.Contains(stdout, token) {
+			t.Fatalf("usage missing cloud serve env/runtime rule %q: %q", token, stdout)
+		}
+	}
 }
 
 func TestPrintPostInstall(t *testing.T) {
@@ -286,6 +300,73 @@ func TestPrintPostInstallClaudeCodeAllowlist(t *testing.T) {
 			t.Fatalf("expected warning in stderr, got: %q", stderr)
 		}
 	})
+}
+
+func TestCmdSyncCloudRegressionPreservesLegacyBehaviorWithUpgradeStatePresent(t *testing.T) {
+	stubExitWithPanic(t)
+	stubRuntimeHooks(t)
+
+	originalSyncExport := syncExport
+	originalSyncStatus := syncStatus
+	t.Cleanup(func() {
+		syncExport = originalSyncExport
+		syncStatus = originalSyncStatus
+	})
+
+	cfg := testConfig(t)
+	t.Setenv("ENGRAM_CLOUD_SERVER", "https://cloud.example.test")
+	t.Setenv("ENGRAM_CLOUD_TOKEN", "token-abc")
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	if err := s.EnrollProject("proj-a"); err != nil {
+		_ = s.Close()
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+		Project:          "proj-a",
+		Stage:            store.UpgradeStageDoctorBlocked,
+		RepairClass:      store.UpgradeRepairClassRepairable,
+		LastErrorCode:    "upgrade_repairable_unenrolled",
+		LastErrorMessage: "legacy metadata drift",
+	}); err != nil {
+		_ = s.Close()
+		t.Fatalf("seed upgrade state: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	syncExport = func(*engramsync.Syncer, string, string) (*engramsync.SyncResult, error) {
+		return &engramsync.SyncResult{ChunkID: "chunk-regression", SessionsExported: 1}, nil
+	}
+	syncStatus = func(*engramsync.Syncer) (int, int, int, error) {
+		return 1, 1, 0, nil
+	}
+
+	withArgs(t, "engram", "sync", "--cloud", "--project", "proj-a")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(cfg) })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("cloud sync regression path should stay successful, panic=%v stderr=%q", recovered, stderr)
+	}
+	if !strings.Contains(stdout, "Cloud sync complete for project \"proj-a\".") {
+		t.Fatalf("expected unchanged cloud sync success messaging, got %q", stdout)
+	}
+
+	s, err = store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New (verify): %v", err)
+	}
+	defer s.Close()
+	state, err := s.GetCloudUpgradeState("proj-a")
+	if err != nil {
+		t.Fatalf("load upgrade state: %v", err)
+	}
+	if state == nil || state.Stage != store.UpgradeStageDoctorBlocked {
+		t.Fatalf("sync --cloud must not mutate upgrade stage; got %+v", state)
+	}
 }
 
 func TestCmdSaveAndSearch(t *testing.T) {
@@ -864,13 +945,9 @@ func TestCmdProjectsAllNoGroups(t *testing.T) {
 }
 
 func TestCmdMCPDetectsProjectFromFlag(t *testing.T) {
-	// Test that --project flag is parsed and passed to MCP config.
-	// We can't easily test the full MCP server startup (it blocks on stdio),
-	// but we test the flag-parsing + detectProject chain indirectly by
-	// checking that cmdMCP doesn't crash when store is available.
-	//
-	// The key invariant tested: --project sets detectedProject correctly.
-	// We verify by stubbing newMCPServerWithConfig and checking the MCPConfig.
+	// JR2-4: --project flag is no longer used (dead code removed). The --project flag
+	// is now silently ignored; project is auto-detected from cwd at each MCP call.
+	// This test verifies cmdMCP still starts correctly when an unknown flag is passed.
 	cfg := testConfig(t)
 
 	var capturedCfg mcp.MCPConfig
@@ -892,9 +969,9 @@ func TestCmdMCPDetectsProjectFromFlag(t *testing.T) {
 	withArgs(t, "engram", "mcp", "--project=myproject")
 	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
 
-	if capturedCfg.DefaultProject != "myproject" {
-		t.Fatalf("expected DefaultProject=%q, got %q", "myproject", capturedCfg.DefaultProject)
-	}
+	// JW6: MCPConfig.DefaultProject removed — verify cmdMCP still calls newMCPServerWithConfig.
+	// The project flag is parsed but project is now auto-detected per call, not stored in config.
+	_ = capturedCfg // MCPConfig{} — no fields to assert
 }
 
 func TestCmdMCPDetectsProjectFromEnv(t *testing.T) {
@@ -919,9 +996,8 @@ func TestCmdMCPDetectsProjectFromEnv(t *testing.T) {
 	withArgs(t, "engram", "mcp")
 	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
 
-	if capturedCfg.DefaultProject != "env-project" {
-		t.Fatalf("expected DefaultProject=%q, got %q", "env-project", capturedCfg.DefaultProject)
-	}
+	// JW6: MCPConfig.DefaultProject removed — just verify cmdMCP completes without panic.
+	_ = capturedCfg
 }
 
 func TestCmdMCPDetectsProjectFromGit(t *testing.T) {
@@ -949,9 +1025,8 @@ func TestCmdMCPDetectsProjectFromGit(t *testing.T) {
 	withArgs(t, "engram", "mcp")
 	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
 
-	if capturedCfg.DefaultProject != "detected-from-git" {
-		t.Fatalf("expected DefaultProject=%q, got %q", "detected-from-git", capturedCfg.DefaultProject)
-	}
+	// JW6: MCPConfig.DefaultProject removed — just verify cmdMCP completes without panic.
+	_ = capturedCfg
 }
 
 func TestCmdSyncUsesDetectProject(t *testing.T) {

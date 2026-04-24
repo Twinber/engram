@@ -129,10 +129,28 @@ type fakeGzipWriter struct {
 type fakeCloudTransport struct {
 	manifest          *Manifest
 	chunks            map[string][]byte
+	lastCreatedBy     string
 	readChunkErr      error
 	readManifestCalls int
 	writeChunkCalls   int
 	readChunkCalls    int
+}
+
+type fakeUpgradeHooks struct {
+	stopCalls   int
+	resumeCalls int
+	stopErr     error
+	resumeErr   error
+}
+
+func (h *fakeUpgradeHooks) StopForUpgrade(_ string) error {
+	h.stopCalls++
+	return h.stopErr
+}
+
+func (h *fakeUpgradeHooks) ResumeAfterUpgrade(_ string) error {
+	h.resumeCalls++
+	return h.resumeErr
 }
 
 func newFakeCloudTransport() *fakeCloudTransport {
@@ -152,10 +170,32 @@ func (f *fakeCloudTransport) WriteManifest(m *Manifest) error {
 	return nil
 }
 
-func (f *fakeCloudTransport) WriteChunk(chunkID string, data []byte, _ ChunkEntry) error {
+func (f *fakeCloudTransport) WriteChunk(chunkID string, data []byte, entry ChunkEntry) error {
 	f.writeChunkCalls++
 	f.chunks[chunkID] = data
+	f.lastCreatedBy = entry.CreatedBy
 	return nil
+}
+
+type mutableUpgradeHooks struct {
+	stopCalls   int
+	resumeCalls int
+	stopErr     error
+	resumeErr   error
+	onStop      func()
+}
+
+func (h *mutableUpgradeHooks) StopForUpgrade(_ string) error {
+	h.stopCalls++
+	if h.onStop != nil {
+		h.onStop()
+	}
+	return h.stopErr
+}
+
+func (h *mutableUpgradeHooks) ResumeAfterUpgrade(_ string) error {
+	h.resumeCalls++
+	return h.resumeErr
 }
 
 func (f *fakeCloudTransport) ReadChunk(chunkID string) ([]byte, error) {
@@ -264,6 +304,335 @@ func TestExportImportFlowWithProjectFilter(t *testing.T) {
 	}
 	if len(dstData.Sessions) != 1 || dstData.Sessions[0].Project != "proj-a" {
 		t.Fatalf("unexpected destination sessions: %+v", dstData.Sessions)
+	}
+}
+
+func TestUpgradeDeterministicReasonCodes(t *testing.T) {
+	tests := []struct {
+		name            string
+		project         string
+		cloudConfigured bool
+		enrolled        bool
+		policyDenied    bool
+		wantClass       string
+		wantCode        string
+		wantStatus      string
+		wantErrContains string
+	}{
+		{
+			name:            "ready when configured and enrolled",
+			project:         "proj-a",
+			cloudConfigured: true,
+			enrolled:        true,
+			wantClass:       UpgradeReasonClassReady,
+			wantCode:        UpgradeReasonReady,
+			wantStatus:      UpgradeStatusReady,
+		},
+		{
+			name:            "repairable when unenrolled",
+			project:         "proj-a",
+			cloudConfigured: true,
+			enrolled:        false,
+			wantClass:       UpgradeReasonClassRepairable,
+			wantCode:        UpgradeReasonRepairableUnenrolled,
+			wantStatus:      UpgradeStatusBlocked,
+		},
+		{
+			name:            "policy when cloud config missing",
+			project:         "proj-a",
+			cloudConfigured: false,
+			enrolled:        false,
+			wantClass:       UpgradeReasonClassPolicy,
+			wantCode:        UpgradeReasonPolicyConfig,
+			wantStatus:      UpgradeStatusBlocked,
+		},
+		{
+			name:            "policy forbidden explicit",
+			project:         "proj-a",
+			cloudConfigured: true,
+			enrolled:        false,
+			policyDenied:    true,
+			wantClass:       UpgradeReasonClassPolicy,
+			wantCode:        UpgradeReasonPolicyForbidden,
+			wantStatus:      UpgradeStatusBlocked,
+		},
+		{
+			name:            "blocked project required fails loudly",
+			project:         "   ",
+			cloudConfigured: true,
+			wantErrContains: "project is required",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			report, err := DiagnoseCloudUpgrade(UpgradeDiagnosisInput{
+				Project:         tc.project,
+				CloudConfigured: tc.cloudConfigured,
+				ProjectEnrolled: tc.enrolled,
+				PolicyDenied:    tc.policyDenied,
+			})
+			if tc.wantErrContains != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrContains) {
+					t.Fatalf("expected error containing %q, got %v", tc.wantErrContains, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected diagnosis error: %v", err)
+			}
+			if report.Class != tc.wantClass || report.Code != tc.wantCode || report.Status != tc.wantStatus {
+				t.Fatalf("unexpected report: %+v", report)
+			}
+
+			report2, err := DiagnoseCloudUpgrade(UpgradeDiagnosisInput{
+				Project:         tc.project,
+				CloudConfigured: tc.cloudConfigured,
+				ProjectEnrolled: tc.enrolled,
+				PolicyDenied:    tc.policyDenied,
+			})
+			if err != nil {
+				t.Fatalf("second diagnosis error: %v", err)
+			}
+			if report != report2 {
+				t.Fatalf("expected deterministic reports, got %+v and %+v", report, report2)
+			}
+		})
+	}
+}
+
+func TestUpgradeBootstrapCheckpointResume(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("bootstrap-s1", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{SessionID: "bootstrap-s1", Type: "decision", Title: "seed", Content: "seed", Project: "proj-a", Scope: "project"}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+		Project:     "proj-a",
+		Stage:       store.UpgradeStageBootstrapEnrolled,
+		RepairClass: store.UpgradeRepairClassRepairable,
+	}); err != nil {
+		t.Fatalf("seed checkpoint stage: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	result, err := BootstrapProject(s, transport, UpgradeBootstrapOptions{Project: "proj-a", CreatedBy: "upgrade-test"})
+	if err != nil {
+		t.Fatalf("bootstrap from checkpoint: %v", err)
+	}
+	if !result.Resumed || result.Stage != store.UpgradeStageBootstrapVerified {
+		t.Fatalf("expected resumed verified bootstrap, got %+v", result)
+	}
+	if transport.writeChunkCalls == 0 {
+		t.Fatal("expected first push to write at least one chunk")
+	}
+
+	writeCallsBefore := transport.writeChunkCalls
+	result2, err := BootstrapProject(s, transport, UpgradeBootstrapOptions{Project: "proj-a", CreatedBy: "upgrade-test"})
+	if err != nil {
+		t.Fatalf("second bootstrap resume: %v", err)
+	}
+	if !result2.NoOp || result2.Stage != store.UpgradeStageBootstrapVerified {
+		t.Fatalf("expected no-op verified bootstrap rerun, got %+v", result2)
+	}
+	if transport.writeChunkCalls != writeCallsBefore {
+		t.Fatalf("expected no additional push writes on rerun, before=%d after=%d", writeCallsBefore, transport.writeChunkCalls)
+	}
+}
+
+func TestRollbackProjectInvokesAutosyncHooksAndHonorsBoundary(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+		Project:     "proj-a",
+		Stage:       store.UpgradeStageBootstrapPushed,
+		RepairClass: store.UpgradeRepairClassRepairable,
+		Snapshot: store.CloudUpgradeSnapshot{
+			CloudConfigPresent: true,
+			ProjectEnrolled:    false,
+		},
+	}); err != nil {
+		t.Fatalf("seed rollback state: %v", err)
+	}
+
+	hooks := &fakeUpgradeHooks{}
+	result, err := RollbackProject(s, UpgradeRollbackOptions{Project: "proj-a", Hooks: hooks})
+	if err != nil {
+		t.Fatalf("rollback project: %v", err)
+	}
+	if result.Stage != store.UpgradeStageRolledBack {
+		t.Fatalf("expected rolled_back stage, got %q", result.Stage)
+	}
+	if hooks.stopCalls != 1 || hooks.resumeCalls != 1 {
+		t.Fatalf("expected one stop/resume call, got stop=%d resume=%d", hooks.stopCalls, hooks.resumeCalls)
+	}
+
+	if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{Project: "proj-a", Stage: store.UpgradeStageBootstrapVerified, RepairClass: store.UpgradeRepairClassReady}); err != nil {
+		t.Fatalf("seed verified boundary: %v", err)
+	}
+	hooks = &fakeUpgradeHooks{}
+	_, err = RollbackProject(s, UpgradeRollbackOptions{Project: "proj-a", Hooks: hooks})
+	if err == nil || !strings.Contains(err.Error(), "rollback is unavailable post-bootstrap") {
+		t.Fatalf("expected post-bootstrap rollback failure, got %v", err)
+	}
+	if hooks.stopCalls != 0 || hooks.resumeCalls != 0 {
+		t.Fatalf("hooks must not run after rollback boundary, got stop=%d resume=%d", hooks.stopCalls, hooks.resumeCalls)
+	}
+}
+
+func TestBootstrapProjectValidationAndCreatedByDefault(t *testing.T) {
+	t.Run("store is required", func(t *testing.T) {
+		_, err := BootstrapProject(nil, newFakeCloudTransport(), UpgradeBootstrapOptions{Project: "proj-a"})
+		if err == nil || !strings.Contains(err.Error(), "requires store") {
+			t.Fatalf("expected requires store error, got %v", err)
+		}
+	})
+
+	t.Run("project is required", func(t *testing.T) {
+		s := newTestStore(t)
+		_, err := BootstrapProject(s, newFakeCloudTransport(), UpgradeBootstrapOptions{Project: "   "})
+		if err == nil || !strings.Contains(err.Error(), "requires project") {
+			t.Fatalf("expected requires project error, got %v", err)
+		}
+	})
+
+	t.Run("blank createdBy defaults to upgrade-bootstrap", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("bootstrap-default-createdby", "proj-a", "/tmp/proj-a"); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if _, err := s.AddObservation(store.AddObservationParams{SessionID: "bootstrap-default-createdby", Type: "decision", Title: "seed", Content: "seed", Project: "proj-a", Scope: "project"}); err != nil {
+			t.Fatalf("add observation: %v", err)
+		}
+
+		transport := newFakeCloudTransport()
+		result, err := BootstrapProject(s, transport, UpgradeBootstrapOptions{Project: "proj-a", CreatedBy: "   "})
+		if err != nil {
+			t.Fatalf("bootstrap project: %v", err)
+		}
+		if result.Project != "proj-a" || result.Stage != store.UpgradeStageBootstrapVerified || result.Resumed {
+			t.Fatalf("unexpected bootstrap result: %+v", result)
+		}
+		if transport.writeChunkCalls == 0 {
+			t.Fatal("expected first bootstrap push to write at least one chunk")
+		}
+		if transport.lastCreatedBy != "upgrade-bootstrap" {
+			t.Fatalf("expected default createdBy upgrade-bootstrap, got %q", transport.lastCreatedBy)
+		}
+	})
+}
+
+func TestRollbackProjectHandlesHookFailures(t *testing.T) {
+	t.Run("stop hook failure blocks rollback", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+			Project:     "proj-a",
+			Stage:       store.UpgradeStageBootstrapPushed,
+			RepairClass: store.UpgradeRepairClassRepairable,
+			Snapshot: store.CloudUpgradeSnapshot{
+				ProjectEnrolled: false,
+			},
+		}); err != nil {
+			t.Fatalf("seed rollback state: %v", err)
+		}
+
+		hooks := &mutableUpgradeHooks{stopErr: errors.New("stop failed")}
+		_, err := RollbackProject(s, UpgradeRollbackOptions{Project: "proj-a", Hooks: hooks})
+		if err == nil || !strings.Contains(err.Error(), "stop autosync") {
+			t.Fatalf("expected stop autosync error, got %v", err)
+		}
+		if hooks.stopCalls != 1 || hooks.resumeCalls != 0 {
+			t.Fatalf("unexpected hook call counts: stop=%d resume=%d", hooks.stopCalls, hooks.resumeCalls)
+		}
+	})
+
+	t.Run("rollback failure attempts resume hook", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+			Project:     "proj-a",
+			Stage:       store.UpgradeStageBootstrapPushed,
+			RepairClass: store.UpgradeRepairClassRepairable,
+			Snapshot: store.CloudUpgradeSnapshot{
+				ProjectEnrolled: false,
+			},
+		}); err != nil {
+			t.Fatalf("seed rollback state: %v", err)
+		}
+
+		hooks := &mutableUpgradeHooks{
+			onStop: func() {
+				_ = s.ClearCloudUpgradeState("proj-a")
+			},
+		}
+		_, err := RollbackProject(s, UpgradeRollbackOptions{Project: "proj-a", Hooks: hooks})
+		if err == nil || !strings.Contains(err.Error(), "rollback requires existing upgrade checkpoint state") {
+			t.Fatalf("expected rollback state missing error, got %v", err)
+		}
+		if hooks.stopCalls != 1 || hooks.resumeCalls != 1 {
+			t.Fatalf("expected rollback failure to invoke resume once, got stop=%d resume=%d", hooks.stopCalls, hooks.resumeCalls)
+		}
+	})
+
+	t.Run("resume hook failure is surfaced", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+			Project:     "proj-a",
+			Stage:       store.UpgradeStageBootstrapPushed,
+			RepairClass: store.UpgradeRepairClassRepairable,
+			Snapshot: store.CloudUpgradeSnapshot{
+				ProjectEnrolled: false,
+			},
+		}); err != nil {
+			t.Fatalf("seed rollback state: %v", err)
+		}
+
+		hooks := &mutableUpgradeHooks{resumeErr: errors.New("resume failed")}
+		_, err := RollbackProject(s, UpgradeRollbackOptions{Project: "proj-a", Hooks: hooks})
+		if err == nil || !strings.Contains(err.Error(), "resume autosync") {
+			t.Fatalf("expected resume autosync error, got %v", err)
+		}
+		if hooks.stopCalls != 1 || hooks.resumeCalls != 1 {
+			t.Fatalf("expected stop/resume once, got stop=%d resume=%d", hooks.stopCalls, hooks.resumeCalls)
+		}
+	})
+}
+
+func TestCloudSyncExportBehaviorUnchangedWhenUpgradeStateExists(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("sync-regression", "proj-a", "/tmp/proj-a"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(store.AddObservationParams{SessionID: "sync-regression", Type: "decision", Title: "regression", Content: "keep legacy behavior", Project: "proj-a", Scope: "project"}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	if err := s.EnrollProject("proj-a"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{Project: "proj-a", Stage: store.UpgradeStageDoctorBlocked, RepairClass: store.UpgradeRepairClassRepairable, LastErrorCode: "upgrade_repairable_unenrolled", LastErrorMessage: "legacy drift"}); err != nil {
+		t.Fatalf("seed upgrade state: %v", err)
+	}
+
+	transport := newFakeCloudTransport()
+	cloudSyncer := NewCloudWithTransport(s, transport, "proj-a")
+	result, err := cloudSyncer.Export("regression", "proj-a")
+	if err != nil {
+		t.Fatalf("cloud export: %v", err)
+	}
+	if result.IsEmpty {
+		t.Fatalf("expected non-empty export to preserve legacy sync path, got %+v", result)
+	}
+	if transport.writeChunkCalls == 0 {
+		t.Fatalf("expected cloud export to push at least one chunk")
+	}
+
+	state, err := s.GetCloudUpgradeState("proj-a")
+	if err != nil {
+		t.Fatalf("load upgrade state: %v", err)
+	}
+	if state == nil || state.Stage != store.UpgradeStageDoctorBlocked {
+		t.Fatalf("legacy cloud export must not mutate upgrade stage, got %+v", state)
 	}
 }
 

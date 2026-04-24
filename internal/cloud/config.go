@@ -13,7 +13,7 @@ type Config struct {
 	MaxPool         int
 	Port            int
 	BindHost        string
-	AdminEmail      string
+	AdminToken      string
 	AllowedProjects []string
 }
 
@@ -43,7 +43,7 @@ func ConfigFromEnv() Config {
 		cfg.JWTSecret = v
 	}
 	if v := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_ADMIN")); v != "" {
-		cfg.AdminEmail = v
+		cfg.AdminToken = v
 	}
 	if v := strings.TrimSpace(os.Getenv("ENGRAM_PORT")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {

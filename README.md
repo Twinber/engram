@@ -150,6 +150,15 @@ unset ENGRAM_CLOUD_TOKEN
 # 4) Enroll an explicit project
 engram cloud enroll smoke-project
 
+# Recommended guided upgrade path for existing local projects
+engram cloud upgrade doctor --project smoke-project
+engram cloud upgrade repair --project smoke-project --dry-run
+engram cloud upgrade repair --project smoke-project --apply
+engram cloud upgrade bootstrap --project smoke-project --resume
+engram cloud upgrade status --project smoke-project
+# rollback is only available before bootstrap is fully verified
+# engram cloud upgrade rollback --project smoke-project
+
 # 5) Run cloud sync explicitly
 engram sync --cloud --project smoke-project
 engram sync --cloud --status --project smoke-project
@@ -158,7 +167,7 @@ engram sync --cloud --status --project smoke-project
 # `engram sync --cloud --all` is intentionally blocked.
 ```
 
-Deterministic failure reasons are surfaced across CLI and server (`/sync/status`):
+Deterministic failure reasons are surfaced across CLI and local server (`engram serve` → `/sync/status`):
 
 - `blocked_unenrolled`
 - `auth_required`
@@ -169,15 +178,35 @@ Deterministic failure reasons are surfaced across CLI and server (`/sync/status`
 
 Cloud preflight/config errors (for example missing or invalid configured server URL) surface as `cloud_config_error`.
 
-Dashboard access note: compose smoke defaults to insecure local-dev mode (`ENGRAM_CLOUD_INSECURE_NO_AUTH=1`) so browser access to `/dashboard` works without extra auth. In authenticated mode, browser users can open `/dashboard/login`, paste the bearer token once, and continue with an HttpOnly dashboard session cookie.
+Upgrade workflow notes:
+
+- `doctor` is read-only and deterministic for unchanged inputs.
+- `repair --apply` only performs deterministic local-safe fixes (no remote mutations).
+- `bootstrap --resume` is checkpointed/idempotent.
+- `rollback` fails loudly once bootstrap reaches `bootstrap_verified`.
+
+Dashboard access note: compose smoke defaults to insecure local-dev mode (`ENGRAM_CLOUD_INSECURE_NO_AUTH=1`) so browser access to `/dashboard` works without extra auth, and `/dashboard/login` redirects to `/dashboard/`. In authenticated mode, browser users can open `/dashboard/login`, paste the bearer token once, and continue with an HttpOnly dashboard session cookie. Protected `/dashboard/*` browser pages require that cookie (raw bearer headers are reserved for `/sync/*`). Restored browser routes include `/dashboard`, `/dashboard/stats`, `/dashboard/activity`, `/dashboard/browser` (`/observations`, `/sessions`, `/sessions/{sessionID}`, `/prompts`), `/dashboard/projects` (plus `/dashboard/projects/{project}` detail), `/dashboard/contributors` (plus `/dashboard/contributors/{contributor}`), and `/dashboard/admin` (`/projects`, `/contributors`). htmx requests return partial fragments, but direct GET/POST navigation remains fully functional without htmx.
+
+Route split reminder:
+
+- `engram serve` (local runtime): `/sync/status` and local memory JSON API.
+- `engram cloud serve` (cloud runtime): `/health`, `/sync/pull`, `/sync/push`, and `/dashboard/*`.
+
+**Background Autosync (opt-in)**: Set `ENGRAM_CLOUD_AUTOSYNC=1` together with `ENGRAM_CLOUD_TOKEN` and `ENGRAM_CLOUD_SERVER` to enable continuous background replication when running `engram serve` or `engram mcp`. See [DOCS.md — Cloud Autosync](DOCS.md#cloud-autosync) for the phase table, reason codes, and troubleshooting.
 
 Runtime toggles:
 
+- `ENGRAM_DATABASE_URL` sets Postgres DSN used by `engram cloud serve`
+- `ENGRAM_PORT` sets cloud runtime port for `engram cloud serve` (default `8080`)
 - `ENGRAM_CLOUD_SYNC=1` enables cloud transport for `engram sync`
 - `ENGRAM_CLOUD_SERVER` overrides configured server URL at runtime
 - `ENGRAM_CLOUD_TOKEN` provides auth token at runtime for authenticated client sync/server auth mode
+- `ENGRAM_CLOUD_INSECURE_NO_AUTH=1` enables local insecure cloud runtime mode (no bearer auth)
+- `ENGRAM_CLOUD_INSECURE_NO_AUTH=1` cannot be combined with `ENGRAM_CLOUD_TOKEN`
 - `ENGRAM_CLOUD_ALLOWED_PROJECTS` is server-side only and must be set before `engram cloud serve` (or in compose env)
 - `ENGRAM_JWT_SECRET` must be explicitly set to a non-default value in authenticated cloud server mode (`ENGRAM_CLOUD_TOKEN` set)
+- `ENGRAM_CLOUD_ADMIN` optionally defines the token value that can access `/dashboard/admin` in authenticated mode only
+- `ENGRAM_CLOUD_ADMIN` is rejected when `ENGRAM_CLOUD_INSECURE_NO_AUTH=1` (no half-working admin path in insecure browser mode)
 
 Cloud runtime bind host:
 
@@ -220,6 +249,8 @@ Full CLI with all flags → [docs/ARCHITECTURE.md#cli-reference](docs/ARCHITECTU
 | [Obsidian Brain](docs/beta/obsidian-brain.md) | Export memories as Obsidian knowledge graph (beta) |
 | [Contributing](CONTRIBUTING.md) | Contribution workflow + standards |
 | [Full Docs](DOCS.md) | Complete technical reference |
+
+> **Dashboard contributors**: if you modify `.templ` files in `internal/cloud/dashboard/`, run `make templ` to regenerate before committing. See [DOCS.md — Dashboard templ regeneration](DOCS.md#dashboard-templ-regeneration).
 
 ## License
 

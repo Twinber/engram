@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"log"
 	"net/http"
 	"strings"
@@ -49,6 +48,7 @@ type CloudServer struct {
 	store          ChunkStore
 	auth           Authenticator
 	projectAuth    ProjectAuthorizer
+	dashboardAdmin string
 	port           int
 	host           string
 	mux            *http.ServeMux
@@ -78,6 +78,12 @@ func WithHost(host string) Option {
 func WithProjectAuthorizer(authorizer ProjectAuthorizer) Option {
 	return func(s *CloudServer) {
 		s.projectAuth = authorizer
+	}
+}
+
+func WithDashboardAdminToken(adminToken string) Option {
+	return func(s *CloudServer) {
+		s.dashboardAdmin = strings.TrimSpace(adminToken)
 	}
 }
 
@@ -124,15 +130,75 @@ func (s *CloudServer) Handler() http.Handler {
 func (s *CloudServer) routes() {
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("GET /health", s.handleHealth)
-	dashboardHandler := dashboard.HandlerWithStatus(s.syncStatus)
-	s.mux.HandleFunc("GET /dashboard/login", s.handleDashboardLoginPage)
-	s.mux.HandleFunc("POST /dashboard/login", s.handleDashboardLogin)
-	s.mux.HandleFunc("POST /dashboard/logout", s.handleDashboardLogout)
-	s.mux.Handle("/dashboard", s.withDashboardAuthHandler(dashboardHandler))
-	s.mux.Handle("/dashboard/", s.withDashboardAuthHandler(dashboardHandler))
+	var dashboardStore dashboard.DashboardStore
+	if store, ok := s.store.(dashboard.DashboardStore); ok {
+		dashboardStore = store
+	}
+	validateLoginToken := func(token string) error {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			return fmt.Errorf("bearer token is required")
+		}
+		if adminToken := strings.TrimSpace(s.dashboardAdmin); adminToken != "" && token == adminToken {
+			return nil
+		}
+		if s.auth == nil {
+			return nil
+		}
+		req, _ := http.NewRequest(http.MethodGet, "/dashboard/login", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		return s.auth.Authorize(req)
+	}
+	createSessionCookie := func(w http.ResponseWriter, r *http.Request, token string) error {
+		sessionToken, err := s.dashboardSessionToken(token)
+		if err != nil {
+			return err
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     dashboardSessionCookieName,
+			Value:    sessionToken,
+			Path:     "/dashboard",
+			HttpOnly: true,
+			Secure:   dashboardCookieSecure(r),
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   int((8 * time.Hour).Seconds()),
+		})
+		return nil
+	}
+	if s.auth == nil {
+		validateLoginToken = nil
+		createSessionCookie = nil
+	}
+	dashboard.Mount(s.mux, dashboard.MountConfig{
+		RequireSession:      s.authorizeDashboardRequest,
+		ValidateLoginToken:  validateLoginToken,
+		CreateSessionCookie: createSessionCookie,
+		ClearSessionCookie: func(w http.ResponseWriter, r *http.Request) {
+			http.SetCookie(w, &http.Cookie{
+				Name:     dashboardSessionCookieName,
+				Value:    "",
+				Path:     "/dashboard",
+				HttpOnly: true,
+				Secure:   dashboardCookieSecure(r),
+				SameSite: http.SameSiteLaxMode,
+				MaxAge:   -1,
+			})
+		},
+		IsAdmin: func(r *http.Request) bool {
+			return s.isDashboardAdmin(r)
+		},
+		// GetDisplayName: returns "OPERATOR" until the session codec surfaces a
+		// display name (out of scope for this change). Satisfies REQ-103 / AD-2.
+		GetDisplayName:    func(r *http.Request) string { return "OPERATOR" },
+		Store:             dashboardStore,
+		MaxLoginBodyBytes: maxDashboardLoginBodyBytes,
+		StatusProvider:    s.syncStatus,
+	})
 	s.mux.HandleFunc("GET /sync/pull", s.withAuth(s.handlePullManifest))
 	s.mux.HandleFunc("GET /sync/pull/{chunkID}", s.withAuth(s.handlePullChunk))
 	s.mux.HandleFunc("POST /sync/push", s.withAuth(s.handlePushChunk))
+	s.mux.HandleFunc("POST /sync/mutations/push", s.withAuth(s.handleMutationPush))
+	s.mux.HandleFunc("GET /sync/mutations/pull", s.withAuth(s.handleMutationPull))
 }
 
 func (s *CloudServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -159,25 +225,8 @@ func (s *CloudServer) withAuthHandler(next http.Handler) http.Handler {
 	})
 }
 
-func (s *CloudServer) withDashboardAuthHandler(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.auth == nil {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if err := s.authorizeDashboardRequest(r); err != nil {
-			http.Redirect(w, r, "/dashboard/login", http.StatusSeeOther)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 func (s *CloudServer) authorizeDashboardRequest(r *http.Request) error {
 	if s.auth == nil {
-		return nil
-	}
-	if err := s.auth.Authorize(r); err == nil {
 		return nil
 	}
 	cookie, err := r.Cookie(dashboardSessionCookieName)
@@ -191,91 +240,12 @@ func (s *CloudServer) authorizeDashboardRequest(r *http.Request) error {
 	if strings.TrimSpace(bearerToken) == "" {
 		return fmt.Errorf("dashboard session token is empty")
 	}
-	clone := r.Clone(r.Context())
-	clone.Header = r.Header.Clone()
-	clone.Header.Set("Authorization", "Bearer "+bearerToken)
-	return s.auth.Authorize(clone)
-}
-
-func (s *CloudServer) handleDashboardLoginPage(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+	if adminToken := strings.TrimSpace(s.dashboardAdmin); adminToken != "" && bearerToken == adminToken {
+		return nil
 	}
-	if s.auth == nil {
-		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
-		return
-	}
-	if err := s.authorizeDashboardRequest(r); err == nil {
-		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
-		return
-	}
-	renderDashboardLoginPage(w, "")
-}
-
-func (s *CloudServer) handleDashboardLogin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if s.auth == nil {
-		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxDashboardLoginBodyBytes)
-	if err := r.ParseForm(); err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			http.Error(w, fmt.Sprintf("login payload too large (max %d bytes)", maxDashboardLoginBodyBytes), http.StatusRequestEntityTooLarge)
-			return
-		}
-		http.Error(w, "invalid form payload", http.StatusBadRequest)
-		return
-	}
-	token := strings.TrimSpace(r.PostForm.Get("token"))
-	if token == "" {
-		renderDashboardLoginPage(w, "token is required")
-		return
-	}
-	testReq := r.Clone(r.Context())
-	testReq.Header = r.Header.Clone()
-	testReq.Header.Set("Authorization", "Bearer "+token)
-	if err := s.auth.Authorize(testReq); err != nil {
-		renderDashboardLoginPage(w, "invalid token")
-		return
-	}
-	sessionToken, err := s.dashboardSessionToken(token)
-	if err != nil {
-		http.Error(w, "unable to create dashboard session", http.StatusInternalServerError)
-		return
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     dashboardSessionCookieName,
-		Value:    sessionToken,
-		Path:     "/dashboard",
-		HttpOnly: true,
-		Secure:   dashboardCookieSecure(r),
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int((8 * time.Hour).Seconds()),
-	})
-	http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
-}
-
-func (s *CloudServer) handleDashboardLogout(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     dashboardSessionCookieName,
-		Value:    "",
-		Path:     "/dashboard",
-		HttpOnly: true,
-		Secure:   dashboardCookieSecure(r),
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   -1,
-	})
-	http.Redirect(w, r, "/dashboard/login", http.StatusSeeOther)
+	req, _ := http.NewRequest(http.MethodGet, "/dashboard", nil)
+	req.Header.Set("Authorization", "Bearer "+bearerToken)
+	return s.auth.Authorize(req)
 }
 
 func (s *CloudServer) dashboardSessionToken(bearerToken string) (string, error) {
@@ -309,33 +279,27 @@ func dashboardCookieSecure(r *http.Request) bool {
 	return false
 }
 
-func renderDashboardLoginPage(w http.ResponseWriter, errorMessage string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	message := ""
-	if strings.TrimSpace(errorMessage) != "" {
-		message = fmt.Sprintf("<p style=\"color:#b91c1c\">%s</p>", html.EscapeString(errorMessage))
-	}
-	_, _ = w.Write([]byte(fmt.Sprintf(`<!doctype html>
-<html>
-<head><title>Engram Cloud Dashboard Login</title></head>
-<body>
-  <main>
-    <h1>Dashboard Login</h1>
-    <p>Paste your cloud bearer token to start a dashboard session cookie.</p>
-    %s
-    <form method="post" action="/dashboard/login">
-      <label for="token">Bearer token</label>
-      <input id="token" name="token" type="password" autocomplete="off" required />
-      <button type="submit">Sign in</button>
-    </form>
-  </main>
-</body>
-</html>`, message)))
-}
-
 func (s *CloudServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]any{"status": "ok", "service": "engram-cloud"})
+}
+
+func (s *CloudServer) isDashboardAdmin(r *http.Request) bool {
+	if s.auth == nil {
+		return false
+	}
+	adminToken := strings.TrimSpace(s.dashboardAdmin)
+	if adminToken == "" {
+		return false
+	}
+	cookie, err := r.Cookie(dashboardSessionCookieName)
+	if err != nil {
+		return false
+	}
+	token, err := s.dashboardBearerToken(cookie.Value)
+	if err != nil {
+		return false
+	}
+	return token == adminToken
 }
 
 func (s *CloudServer) handlePullManifest(w http.ResponseWriter, r *http.Request) {
@@ -392,14 +356,14 @@ func (s *CloudServer) handlePushChunk(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			http.Error(w, fmt.Sprintf("push payload too large (max %d bytes)", maxPushBodyBytes), http.StatusRequestEntityTooLarge)
+			writeActionableError(w, http.StatusRequestEntityTooLarge, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadTooLarge, fmt.Sprintf("push payload too large (max %d bytes)", maxPushBodyBytes))
 			return
 		}
-		http.Error(w, fmt.Sprintf("invalid push payload: %v", err), http.StatusBadRequest)
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("invalid push payload: %v", err))
 		return
 	}
 	if len(req.Data) == 0 {
-		http.Error(w, "data is required", http.StatusBadRequest)
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, "data is required")
 		return
 	}
 	project := strings.TrimSpace(req.Project)
@@ -407,59 +371,82 @@ func (s *CloudServer) handlePushChunk(w http.ResponseWriter, r *http.Request) {
 		project = strings.TrimSpace(r.URL.Query().Get("project"))
 	}
 	if project == "" {
-		http.Error(w, "project is required", http.StatusBadRequest)
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeProjectRequired, "project is required")
 		return
 	}
 	project, _ = store.NormalizeProject(project)
 	project = strings.TrimSpace(project)
 	if project == "" {
-		http.Error(w, "project is required", http.StatusBadRequest)
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeProjectRequired, "project is required")
 		return
 	}
 	if !s.authorizeProjectScope(w, project) {
 		return
 	}
 
+	// Push-path pause guard: check project sync control before accepting the chunk.
+	// Uses a structural interface assertion so the ChunkStore interface is NOT extended.
+	// Satisfies REQ-109 / Design Decision 5.
+	if storeForControls, ok := s.store.(interface {
+		IsProjectSyncEnabled(project string) (bool, error)
+	}); ok {
+		enabled, err := storeForControls.IsProjectSyncEnabled(project)
+		if err != nil {
+			writeActionableError(w, http.StatusInternalServerError,
+				constants.UpgradeErrorClassBlocked,
+				constants.UpgradeErrorCodeInternal,
+				fmt.Sprintf("check project control: %v", err))
+			return
+		}
+		if !enabled {
+			writeActionableError(w, http.StatusConflict,
+				constants.UpgradeErrorClassPolicy,
+				"sync-paused",
+				fmt.Sprintf("sync is paused for project %q", project))
+			return
+		}
+	}
+
 	normalizedData, err := coerceChunkProject(req.Data, project)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("invalid push payload: %v", err), http.StatusBadRequest)
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("invalid push payload: %v", err))
 		return
 	}
 	chunk, err := validateImportableChunkPayload(normalizedData)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("invalid push payload: %v", err), http.StatusBadRequest)
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("invalid push payload: %v", err))
 		return
 	}
 	knownSessionIDs, err := s.store.KnownSessionIDs(r.Context(), project)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("validate push payload: %v", err), http.StatusInternalServerError)
+		writeActionableError(w, http.StatusInternalServerError, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeInternal, fmt.Sprintf("validate push payload: %v", err))
 		return
 	}
 	if err := validateChunkSessionReferences(chunk, knownSessionIDs); err != nil {
-		http.Error(w, fmt.Sprintf("invalid push payload: %v", err), http.StatusBadRequest)
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("invalid push payload: %v", err))
 		return
 	}
 
 	computedChunkID := chunkIDFromPayload(normalizedData)
 	providedChunkID := strings.TrimSpace(req.ChunkID)
 	if providedChunkID != "" && providedChunkID != computedChunkID {
-		http.Error(w, fmt.Sprintf("chunk_id does not match payload content hash (expected %s)", computedChunkID), http.StatusBadRequest)
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("chunk_id does not match payload content hash (expected %s)", computedChunkID))
 		return
 	}
 	clientCreatedAt := strings.TrimSpace(req.ClientCreatedAt)
 	if clientCreatedAt != "" {
 		if _, err := time.Parse(time.RFC3339, clientCreatedAt); err != nil {
-			http.Error(w, "client_created_at must be RFC3339", http.StatusBadRequest)
+			writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, "client_created_at must be RFC3339")
 			return
 		}
 	}
 
 	if err := s.store.WriteChunk(r.Context(), project, computedChunkID, req.CreatedBy, clientCreatedAt, normalizedData); err != nil {
 		if errors.Is(err, cloudstore.ErrChunkConflict) {
-			http.Error(w, fmt.Sprintf("write chunk: %v", err), http.StatusConflict)
+			writeActionableError(w, http.StatusConflict, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodeChunkConflict, fmt.Sprintf("write chunk: %v", err))
 			return
 		}
-		http.Error(w, fmt.Sprintf("write chunk: %v", err), http.StatusInternalServerError)
+		writeActionableError(w, http.StatusInternalServerError, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeInternal, fmt.Sprintf("write chunk: %v", err))
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"status": "ok", "chunk_id": computedChunkID})
@@ -472,13 +459,13 @@ func chunkIDFromPayload(payload []byte) string {
 func projectFromRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
 	project := strings.TrimSpace(r.URL.Query().Get("project"))
 	if project == "" {
-		http.Error(w, "project is required", http.StatusBadRequest)
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeProjectRequired, "project is required")
 		return "", false
 	}
 	project, _ = store.NormalizeProject(project)
 	project = strings.TrimSpace(project)
 	if project == "" {
-		http.Error(w, "project is required", http.StatusBadRequest)
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeProjectRequired, "project is required")
 		return "", false
 	}
 	return project, true
@@ -489,10 +476,18 @@ func (s *CloudServer) authorizeProjectScope(w http.ResponseWriter, project strin
 		return true
 	}
 	if err := s.projectAuth.AuthorizeProject(project); err != nil {
-		http.Error(w, "forbidden: project is not allowed", http.StatusForbidden)
+		writeActionableError(w, http.StatusForbidden, constants.UpgradeErrorClassPolicy, constants.ReasonPolicyForbidden, "forbidden: project is not allowed")
 		return false
 	}
 	return true
+}
+
+func writeActionableError(w http.ResponseWriter, status int, class, code, message string) {
+	jsonResponse(w, status, map[string]any{
+		"error_class": strings.TrimSpace(class),
+		"error_code":  strings.TrimSpace(code),
+		"error":       strings.TrimSpace(message),
+	})
 }
 
 func coerceChunkProject(payload []byte, project string) ([]byte, error) {

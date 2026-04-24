@@ -51,6 +51,41 @@ func TestReadManifestReturnsHTTPStatusErrorForAuthAndPolicyFailures(t *testing.T
 	}
 }
 
+func TestReadManifestParsesMachineActionableErrorPayload(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error_class":"repairable","error_code":"upgrade_repairable_payload_invalid","error":"invalid push payload: sessions[0].directory is required"}`))
+	}))
+	defer srv.Close()
+
+	rt, err := NewRemoteTransport(srv.URL, "token", "proj-a")
+	if err != nil {
+		t.Fatalf("NewRemoteTransport: %v", err)
+	}
+
+	_, err = rt.ReadManifest()
+	if err == nil {
+		t.Fatal("expected ReadManifest error")
+	}
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("expected HTTPStatusError, got %T (%v)", err, err)
+	}
+	if statusErr.ErrorClass != "repairable" {
+		t.Fatalf("expected repairable class, got %q", statusErr.ErrorClass)
+	}
+	if statusErr.ErrorCode != "upgrade_repairable_payload_invalid" {
+		t.Fatalf("expected actionable error code, got %q", statusErr.ErrorCode)
+	}
+	if !statusErr.IsRepairableMigrationFailure() {
+		t.Fatalf("expected IsRepairableMigrationFailure=true, got false")
+	}
+	if !strings.Contains(statusErr.Error(), "sessions[0].directory is required") {
+		t.Fatalf("expected error message to preserve actionable detail, got %q", statusErr.Error())
+	}
+}
+
 func TestWriteChunkCanonicalizesPayloadAndChunkID(t *testing.T) {
 	var gotChunkID string
 	var gotClientCreatedAt string

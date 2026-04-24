@@ -1,0 +1,216 @@
+package cloudserver
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
+	"github.com/Gentleman-Programming/engram/internal/cloud/constants"
+)
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+// MutationEntry is an alias for cloudstore.MutationEntry (canonical wire type).
+// Using a type alias ensures cloudstore.CloudStore satisfies MutationStore without
+// adapter shims.
+type MutationEntry = cloudstore.MutationEntry
+
+// StoredMutation is an alias for cloudstore.StoredMutation (canonical read type).
+type StoredMutation = cloudstore.StoredMutation
+
+// MutationStore is the subset of store methods needed by mutation handlers.
+// It is satisfied by cloudstore.CloudStore and by test fakes.
+// BC1: Using cloudstore types directly (via alias) ensures the type assertion
+// s.store.(MutationStore) succeeds at runtime with a real *cloudstore.CloudStore.
+type MutationStore interface {
+	InsertMutationBatch(ctx context.Context, batch []cloudstore.MutationEntry) ([]int64, error)
+	ListMutationsSince(ctx context.Context, sinceSeq int64, limit int, allowedProjects []string) ([]cloudstore.StoredMutation, bool, int64, error)
+	IsProjectSyncEnabled(project string) (bool, error)
+}
+
+// Compile-time assertion: *cloudstore.CloudStore must satisfy MutationStore.
+// This prevents future regressions where cloudstore changes break the interface contract.
+var _ MutationStore = (*cloudstore.CloudStore)(nil)
+
+// EnrolledProjectsProvider is an optional extension of ProjectAuthorizer
+// that returns the list of enrolled projects for the authenticated caller.
+type EnrolledProjectsProvider interface {
+	EnrolledProjects() []string
+}
+
+const maxMutationBatchSize = 100
+const defaultPullLimit = 100
+
+// ─── Handlers ────────────────────────────────────────────────────────────────
+
+// handleMutationPush handles POST /sync/mutations/push.
+// REQ-200: bearer auth, body limit 8 MiB, batch size cap 100, pause gate (409 on sync_enabled=false).
+// BC2: project authorization is enforced for every distinct project in the batch.
+// BW9: 409 pause response uses writeActionableError for structured error envelope.
+func (s *CloudServer) handleMutationPush(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxPushBodyBytes)
+
+	var req struct {
+		Entries []MutationEntry `json:"entries"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if len(req.Entries) > maxMutationBatchSize {
+		http.Error(w, fmt.Sprintf("batch too large: max %d entries per request", maxMutationBatchSize), http.StatusBadRequest)
+		return
+	}
+
+	// BR2-1: Reject any entry with an empty project before auth/pause checks.
+	// An empty project is always invalid: it bypasses per-project auth and would
+	// be inserted into cloud_mutations with a blank project column.
+	for _, entry := range req.Entries {
+		if strings.TrimSpace(entry.Project) == "" {
+			writeActionableError(w, http.StatusBadRequest, "invalid_request", "empty_project",
+				"mutation entries must specify a project")
+			return
+		}
+	}
+
+	// BC2: Authorize every distinct project in the batch before accepting any entry.
+	// If ANY project is unauthorized, the entire batch is rejected (all-or-nothing).
+	seen := make(map[string]struct{})
+	for _, entry := range req.Entries {
+		project := strings.TrimSpace(entry.Project)
+		if project == "" {
+			continue
+		}
+		if _, ok := seen[project]; ok {
+			continue
+		}
+		seen[project] = struct{}{}
+		if !s.authorizeProjectScope(w, project) {
+			// authorizeProjectScope already wrote the 403 response.
+			return
+		}
+	}
+
+	// Check sync pause per project (REQ-203 + BW9: use writeActionableError for 409).
+	if ms, ok := s.store.(MutationStore); ok {
+		for _, entry := range req.Entries {
+			project := strings.TrimSpace(entry.Project)
+			if project == "" {
+				continue
+			}
+			enabled, err := ms.IsProjectSyncEnabled(project)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("check project sync: %v", err), http.StatusInternalServerError)
+				return
+			}
+			if !enabled {
+				// BW9: structured error envelope so clients can parse error_class/error_code.
+				writeActionableError(w, http.StatusConflict, constants.UpgradeErrorClassPolicy, "sync-paused",
+					fmt.Sprintf("sync is paused for project %q", project))
+				return
+			}
+		}
+	}
+
+	// Empty batch → 200 with empty accepted_seqs.
+	if len(req.Entries) == 0 {
+		jsonResponse(w, http.StatusOK, map[string]any{"accepted_seqs": []int64{}})
+		return
+	}
+
+	ms, ok := s.store.(MutationStore)
+	if !ok {
+		http.Error(w, "mutation store not available", http.StatusInternalServerError)
+		return
+	}
+
+	acceptedSeqs, err := ms.InsertMutationBatch(r.Context(), req.Entries)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("insert mutations: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{"accepted_seqs": acceptedSeqs})
+}
+
+// handleMutationPull handles GET /sync/mutations/pull.
+// REQ-201: bearer auth, since_seq/limit params, server-side enrollment filter.
+func (s *CloudServer) handleMutationPull(w http.ResponseWriter, r *http.Request) {
+	sinceSeqStr := strings.TrimSpace(r.URL.Query().Get("since_seq"))
+	limitStr := strings.TrimSpace(r.URL.Query().Get("limit"))
+
+	sinceSeq := int64(0)
+	if sinceSeqStr != "" {
+		if v, err := strconv.ParseInt(sinceSeqStr, 10, 64); err == nil {
+			sinceSeq = v
+		}
+	}
+
+	limit := defaultPullLimit
+	if limitStr != "" {
+		if v, err := strconv.Atoi(limitStr); err == nil && v > 0 {
+			if v > defaultPullLimit {
+				v = defaultPullLimit
+			}
+			limit = v
+		}
+	}
+
+	// Resolve allowed projects from the caller's enrollment (REQ-202).
+	// BW2: Fail closed — when projectAuth is set but does not implement
+	// EnrolledProjectsProvider, default to an empty allowedProjects slice
+	// (returns nothing) rather than nil (which returns everything).
+	var allowedProjects []string
+	if s.projectAuth != nil {
+		if ep, ok := s.projectAuth.(EnrolledProjectsProvider); ok {
+			allowedProjects = ep.EnrolledProjects()
+		} else {
+			// EnrolledProjectsProvider not implemented: fail closed with empty list.
+			// Log a warning so operators know the contract is violated.
+			log.Printf("[cloudserver] WARNING: projectAuth (%T) does not implement EnrolledProjectsProvider; mutation pull returns empty to prevent cross-tenant leak", s.projectAuth)
+			allowedProjects = []string{}
+		}
+	}
+
+	ms, ok := s.store.(MutationStore)
+	if !ok {
+		jsonResponse(w, http.StatusOK, map[string]any{
+			"mutations":  []StoredMutation{},
+			"has_more":   false,
+			"latest_seq": int64(0),
+		})
+		return
+	}
+
+	mutations, hasMore, latestSeq, err := ms.ListMutationsSince(r.Context(), sinceSeq, limit, allowedProjects)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("list mutations: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if mutations == nil {
+		mutations = []StoredMutation{}
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"mutations":  mutations,
+		"has_more":   hasMore,
+		"latest_seq": latestSeq,
+	})
+}
+
+// ─── Cloudstore mutation queries ──────────────────────────────────────────────
+// These are implemented directly on CloudStore in cloudstore/cloudstore.go.
+// The migration adds a cloud_mutations table. See AddMutationMigrations().
+
+// mutationOccurredAt returns a stable RFC3339 timestamp for a stored mutation.
+func mutationOccurredAt() string {
+	return time.Now().UTC().Format(time.RFC3339)
+}

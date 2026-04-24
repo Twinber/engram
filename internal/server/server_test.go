@@ -341,10 +341,13 @@ func TestSyncStatusDegraded(t *testing.T) {
 func TestSyncStatusIncludesReasonParityFields(t *testing.T) {
 	provider := &stubSyncStatusProvider{
 		status: SyncStatus{
-			Enabled:       true,
-			Phase:         "degraded",
-			ReasonCode:    "auth_required",
-			ReasonMessage: "cloud token expired",
+			Enabled:              true,
+			Phase:                "degraded",
+			ReasonCode:           "auth_required",
+			ReasonMessage:        "cloud token expired",
+			UpgradeStage:         "bootstrap_pushed",
+			UpgradeReasonCode:    "upgrade_repair_backfill_sync_journal",
+			UpgradeReasonMessage: "repair pending",
 		},
 	}
 
@@ -368,6 +371,16 @@ func TestSyncStatusIncludesReasonParityFields(t *testing.T) {
 	}
 	if resp["reason_message"] != "cloud token expired" {
 		t.Fatalf("expected reason_message, got %v", resp["reason_message"])
+	}
+	upgradeRaw, ok := resp["upgrade"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected upgrade object in /sync/status response, got %#v", resp["upgrade"])
+	}
+	if upgradeRaw["stage"] != "bootstrap_pushed" {
+		t.Fatalf("expected upgrade stage bootstrap_pushed, got %v", upgradeRaw["stage"])
+	}
+	if upgradeRaw["reason_code"] != "upgrade_repair_backfill_sync_journal" {
+		t.Fatalf("expected upgrade reason_code parity, got %v", upgradeRaw["reason_code"])
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -26,6 +27,8 @@ type RemoteTransport struct {
 type HTTPStatusError struct {
 	Operation  string
 	StatusCode int
+	ErrorClass string
+	ErrorCode  string
 	Body       string
 }
 
@@ -41,11 +44,32 @@ func (e *HTTPStatusError) IsPolicyFailure() bool {
 	return e != nil && e.StatusCode == http.StatusForbidden
 }
 
+func (e *HTTPStatusError) IsRepairableMigrationFailure() bool {
+	return e != nil && strings.TrimSpace(strings.ToLower(e.ErrorClass)) == "repairable"
+}
+
 func newHTTPStatusError(operation string, statusCode int, body []byte) error {
+	errorClass := ""
+	errorCode := ""
+	message := strings.TrimSpace(string(body))
+	var payload struct {
+		ErrorClass string `json:"error_class"`
+		ErrorCode  string `json:"error_code"`
+		Error      string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err == nil {
+		errorClass = strings.TrimSpace(payload.ErrorClass)
+		errorCode = strings.TrimSpace(payload.ErrorCode)
+		if msg := strings.TrimSpace(payload.Error); msg != "" {
+			message = msg
+		}
+	}
 	return &HTTPStatusError{
 		Operation:  operation,
 		StatusCode: statusCode,
-		Body:       strings.TrimSpace(string(body)),
+		ErrorClass: errorClass,
+		ErrorCode:  errorCode,
+		Body:       message,
 	}
 }
 
@@ -227,13 +251,16 @@ func (rt *RemoteTransport) ReadChunk(chunkID string) ([]byte, error) {
 }
 
 type MutationEntry struct {
+	Project   string          `json:"project"`
 	Entity    string          `json:"entity"`
 	EntityKey string          `json:"entity_key"`
 	Op        string          `json:"op"`
 	Payload   json.RawMessage `json:"payload"`
 }
 
-type PushMutationsResult struct{}
+type PushMutationsResult struct {
+	AcceptedSeqs []int64 `json:"accepted_seqs"`
+}
 
 type PulledMutation struct {
 	Seq        int64           `json:"seq"`
@@ -246,6 +273,8 @@ type PulledMutation struct {
 
 type PullMutationsResponse struct {
 	Mutations []PulledMutation `json:"mutations"`
+	HasMore   bool             `json:"has_more"`
+	LatestSeq int64            `json:"latest_seq"`
 }
 
 func (rt *RemoteTransport) PushMutations(_ []MutationEntry) (*PushMutationsResult, error) {
@@ -254,4 +283,135 @@ func (rt *RemoteTransport) PushMutations(_ []MutationEntry) (*PushMutationsResul
 
 func (rt *RemoteTransport) PullMutations(_ int64, _ int) (*PullMutationsResponse, error) {
 	return nil, fmt.Errorf("cloud: mutation pull is not available in this release")
+}
+
+// ─── MutationTransport ────────────────────────────────────────────────────────
+
+// MutationTransport handles push/pull of fine-grained mutations to the cloud server.
+// Unlike RemoteTransport (which handles chunk-level sync), this operates on the
+// mutation journal and supports cursor-based pull.
+type MutationTransport struct {
+	baseURL    string
+	token      string
+	httpClient *http.Client
+}
+
+// NewMutationTransport creates a MutationTransport. baseURL must be a valid http/https URL.
+// BW6: Reuses validateBaseURL to reject empty/malformed URLs.
+func NewMutationTransport(baseURL, token string) (*MutationTransport, error) {
+	normalized, err := validateBaseURL(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	return &MutationTransport{
+		baseURL: normalized,
+		token:   strings.TrimSpace(token),
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}, nil
+}
+
+func (mt *MutationTransport) setAuthorization(req *http.Request) {
+	if mt.token != "" {
+		req.Header.Set("Authorization", "Bearer "+mt.token)
+	}
+}
+
+// PushMutations POSTs a batch of mutations to the cloud server.
+// REQ-200: 404 → reason_code=server_unsupported; 401 → IsAuthFailure.
+func (mt *MutationTransport) PushMutations(entries []MutationEntry) ([]int64, error) {
+	body, err := json.Marshal(map[string]any{"entries": entries})
+	if err != nil {
+		return nil, fmt.Errorf("cloud: marshal mutation push: %w", err)
+	}
+
+	reqURL := mt.baseURL + "/sync/mutations/push"
+	req, err := http.NewRequest(http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("cloud: build mutation push request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	mt.setAuthorization(req)
+
+	resp, err := mt.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("cloud: mutation push: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		statusErr := newMutationHTTPStatusError("mutation push", resp.StatusCode, respBody)
+		return nil, statusErr
+	}
+
+	var result struct {
+		AcceptedSeqs []int64 `json:"accepted_seqs"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("cloud: decode mutation push response: %w", err)
+	}
+	return result.AcceptedSeqs, nil
+}
+
+// PullMutations fetches mutations from the cloud server since the given sequence.
+// REQ-201: 404 → reason_code=server_unsupported; 401 → IsAuthFailure.
+func (mt *MutationTransport) PullMutations(sinceSeq int64, limit int) (*PullMutationsResponse, error) {
+	reqURL := fmt.Sprintf("%s/sync/mutations/pull?since_seq=%d&limit=%d", mt.baseURL, sinceSeq, limit)
+	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("cloud: build mutation pull request: %w", err)
+	}
+	mt.setAuthorization(req)
+
+	resp, err := mt.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("cloud: mutation pull: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		statusErr := newMutationHTTPStatusError("mutation pull", resp.StatusCode, respBody)
+		return nil, statusErr
+	}
+
+	var result PullMutationsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("cloud: decode mutation pull response: %w", err)
+	}
+	return &result, nil
+}
+
+// newMutationHTTPStatusError creates an HTTPStatusError for mutation transport operations.
+// REQ-214: 404 → ErrorCode="server_unsupported".
+func newMutationHTTPStatusError(operation string, statusCode int, body []byte) error {
+	// Try to parse standard error envelope first.
+	var payload struct {
+		ErrorClass string `json:"error_class"`
+		ErrorCode  string `json:"error_code"`
+		Error      string `json:"error"`
+	}
+	message := strings.TrimSpace(string(body))
+	if err := json.Unmarshal(body, &payload); err == nil {
+		if msg := strings.TrimSpace(payload.Error); msg != "" {
+			message = msg
+		}
+	}
+
+	// REQ-214 + BC3: 404 maps to server_unsupported and emits an operator warning.
+	errorCode := strings.TrimSpace(payload.ErrorCode)
+	if statusCode == http.StatusNotFound {
+		errorCode = "server_unsupported"
+		log.Printf("[autosync] cloud mutation endpoint returned 404 (server_unsupported); deploy the new server first before enabling ENGRAM_CLOUD_AUTOSYNC=1")
+	}
+
+	return &HTTPStatusError{
+		Operation:  operation,
+		StatusCode: statusCode,
+		ErrorClass: strings.TrimSpace(payload.ErrorClass),
+		ErrorCode:  errorCode,
+		Body:       message,
+	}
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
 	"github.com/Gentleman-Programming/engram/internal/cloud/constants"
 	"github.com/Gentleman-Programming/engram/internal/cloud/dashboard"
+	"github.com/Gentleman-Programming/engram/internal/cloud/remote"
 	"github.com/Gentleman-Programming/engram/internal/store"
 	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
 )
@@ -81,18 +83,22 @@ var newCloudRuntime = func(cfg cloud.Config) (cloudServerRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
-	authSvc, err := auth.NewService(cs, cfg.JWTSecret)
-	if err != nil {
-		_ = cs.Close()
-		return nil, err
-	}
 	allowedProjects := normalizeAllowedProjects(cfg.AllowedProjects)
+	projectAuth := auth.NewProjectScopeAuthorizer(allowedProjects)
 	token := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_TOKEN"))
-	authSvc.SetBearerToken(token)
-	authSvc.SetAllowedProjects(allowedProjects)
-	var authenticator cloudserver.Authenticator = authSvc
-	if token == "" && envBool("ENGRAM_CLOUD_INSECURE_NO_AUTH") {
-		authenticator = nil
+	cs.SetDashboardAllowedProjects(allowedProjects)
+	insecureNoAuth := token == "" && envBool("ENGRAM_CLOUD_INSECURE_NO_AUTH")
+	var authenticator cloudserver.Authenticator
+	if !insecureNoAuth {
+		authSvc, err := auth.NewService(cs, cfg.JWTSecret)
+		if err != nil {
+			_ = cs.Close()
+			return nil, err
+		}
+		authSvc.SetBearerToken(token)
+		authSvc.SetAllowedProjects(allowedProjects)
+		authSvc.SetDashboardSessionTokens([]string{cfg.AdminToken})
+		authenticator = authSvc
 	}
 	return &defaultCloudRuntime{
 		server: cloudserver.New(
@@ -100,11 +106,20 @@ var newCloudRuntime = func(cfg cloud.Config) (cloudServerRuntime, error) {
 			authenticator,
 			cfg.Port,
 			cloudserver.WithHost(cfg.BindHost),
-			cloudserver.WithProjectAuthorizer(authSvc),
+			cloudserver.WithProjectAuthorizer(projectAuth),
+			cloudserver.WithDashboardAdminToken(cfg.AdminToken),
 			cloudserver.WithSyncStatusProvider(cloudDashboardStatusProvider{store: cs, projects: allowedProjects}),
 		),
 		store: cs,
 	}, nil
+}
+
+var runUpgradeBootstrap = func(s *store.Store, project string, cc *cloudConfig) (*engramsync.UpgradeBootstrapResult, error) {
+	transport, err := remote.NewRemoteTransport(cc.ServerURL, cc.Token, project)
+	if err != nil {
+		return nil, err
+	}
+	return engramsync.BootstrapProject(s, transport, engramsync.UpgradeBootstrapOptions{Project: project, CreatedBy: "engram-cloud-upgrade"})
 }
 
 type cloudConfig struct {
@@ -115,7 +130,7 @@ type cloudConfig struct {
 func cmdCloud(cfg store.Config) {
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "usage: engram cloud <subcommand> [options]")
-		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, serve")
+		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, serve, upgrade")
 		exitFunc(1)
 	}
 
@@ -128,11 +143,381 @@ func cmdCloud(cfg store.Config) {
 		cmdCloudConfig(cfg)
 	case "serve":
 		cmdCloudServe()
+	case "upgrade":
+		cmdCloudUpgrade(cfg)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown cloud command: %s\n", os.Args[2])
-		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, serve")
+		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, serve, upgrade")
 		exitFunc(1)
 	}
+}
+
+func cmdCloudUpgrade(cfg store.Config) {
+	if len(os.Args) < 4 {
+		fmt.Fprintln(os.Stderr, "usage: engram cloud upgrade <doctor|repair|bootstrap|status|rollback> --project <name>")
+		exitFunc(1)
+		return
+	}
+	command := strings.TrimSpace(strings.ToLower(os.Args[3]))
+	if command == "--help" || command == "-h" || command == "help" {
+		fmt.Println("engram cloud upgrade")
+		fmt.Println("workflow: doctor -> repair -> bootstrap -> status/rollback")
+		fmt.Println("cloud is opt-in replication/shared access; local SQLite remains source of truth")
+		fmt.Println("usage: engram cloud upgrade <doctor|repair|bootstrap|status|rollback> --project <name>")
+		return
+	}
+	switch command {
+	case "doctor":
+		cmdCloudUpgradeDoctor(cfg)
+	case "repair":
+		cmdCloudUpgradeRepair(cfg)
+	case "bootstrap":
+		cmdCloudUpgradeBootstrap(cfg)
+	case "status":
+		cmdCloudUpgradeStatus(cfg)
+	case "rollback":
+		cmdCloudUpgradeRollback(cfg)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown cloud upgrade command: %s\n", command)
+		fmt.Fprintln(os.Stderr, "supported cloud upgrade commands: doctor, repair, bootstrap, status, rollback")
+		exitFunc(1)
+	}
+}
+
+func cmdCloudUpgradeDoctor(cfg store.Config) {
+	project := parseCloudUpgradeProjectArg(os.Args[4:])
+	if project == "" {
+		fmt.Fprintln(os.Stderr, "usage: engram cloud upgrade doctor --project <name>")
+		fmt.Fprintln(os.Stderr, "error: --project is required")
+		exitFunc(1)
+		return
+	}
+
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	defer s.Close()
+
+	cloudConfigured := false
+	if cc, cfgErr := resolveCloudRuntimeConfig(cfg); cfgErr == nil {
+		if cc != nil {
+			if validated, err := validateCloudServerURL(cc.ServerURL); err == nil && strings.TrimSpace(validated) != "" {
+				cloudConfigured = true
+			}
+		}
+	}
+	enrolled, err := s.IsProjectEnrolled(project)
+	if err != nil {
+		fatal(fmt.Errorf("cloud upgrade doctor enrollment check: %w", err))
+		return
+	}
+	policyDenied, err := cloudUpgradePolicyDenied(s, project)
+	if err != nil {
+		fatal(fmt.Errorf("cloud upgrade doctor policy check: %w", err))
+		return
+	}
+
+	report, err := engramsync.DiagnoseCloudUpgrade(engramsync.UpgradeDiagnosisInput{
+		Project:         project,
+		CloudConfigured: cloudConfigured,
+		ProjectEnrolled: enrolled,
+		PolicyDenied:    policyDenied,
+	})
+	if err != nil {
+		fatal(err)
+		return
+	}
+
+	legacyReport, err := s.DiagnoseCloudUpgradeLegacyMutations(project)
+	if err != nil {
+		fatal(fmt.Errorf("cloud upgrade doctor legacy mutation diagnosis: %w", err))
+		return
+	}
+	if legacyReport.BlockedCount > 0 {
+		first := legacyReport.Findings[0]
+		report = engramsync.UpgradeDiagnosisReport{
+			Status:  engramsync.UpgradeStatusBlocked,
+			Class:   engramsync.UpgradeReasonClassBlocked,
+			Code:    store.UpgradeReasonBlockedLegacyMutationManual,
+			Message: fmt.Sprintf("manual-action-required: %s (seq=%d entity=%s op=%s)", first.Message, first.Seq, first.Entity, first.Op),
+		}
+	} else if legacyReport.RepairableCount > 0 {
+		report = engramsync.UpgradeDiagnosisReport{
+			Status:  engramsync.UpgradeStatusBlocked,
+			Class:   engramsync.UpgradeReasonClassRepairable,
+			Code:    store.UpgradeReasonRepairableLegacyMutationPayload,
+			Message: fmt.Sprintf("project %q has %d repairable legacy mutation payload issue(s); run `engram cloud upgrade repair --project %s --apply`", project, legacyReport.RepairableCount, project),
+		}
+	}
+
+	stage := store.UpgradeStageDoctorBlocked
+	if report.Status == engramsync.UpgradeStatusReady {
+		stage = store.UpgradeStageDoctorReady
+	}
+	_ = s.SaveCloudUpgradeState(store.CloudUpgradeState{
+		Project:          project,
+		Stage:            stage,
+		RepairClass:      report.Class,
+		LastErrorCode:    report.Code,
+		LastErrorMessage: report.Message,
+	})
+
+	fmt.Printf("project: %s\n", project)
+	fmt.Printf("status: %s\n", report.Status)
+	fmt.Printf("class: %s\n", report.Class)
+	fmt.Printf("reason_code: %s\n", report.Code)
+	fmt.Printf("message: %s\n", report.Message)
+}
+
+func cloudUpgradePolicyDenied(s *store.Store, project string) (bool, error) {
+	targets := []string{cloudTargetKeyForProject(project)}
+	if cloudTargetKeyForProject(project) != constants.TargetKeyCloud {
+		targets = append(targets, constants.TargetKeyCloud)
+	}
+	for _, targetKey := range targets {
+		state, err := s.GetSyncState(targetKey)
+		if err != nil {
+			return false, err
+		}
+		if state == nil {
+			continue
+		}
+		if strings.TrimSpace(derefString(state.ReasonCode)) == constants.ReasonPolicyForbidden {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func parseCloudUpgradeProjectArg(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if strings.TrimSpace(args[i]) != "--project" {
+			continue
+		}
+		if i+1 >= len(args) {
+			return ""
+		}
+		project, _ := store.NormalizeProject(args[i+1])
+		return strings.TrimSpace(project)
+	}
+	return ""
+}
+
+func cmdCloudUpgradeRepair(cfg store.Config) {
+	project := parseCloudUpgradeProjectArg(os.Args[4:])
+	if project == "" {
+		fmt.Fprintln(os.Stderr, "usage: engram cloud upgrade repair --project <name> [--dry-run|--apply]")
+		fmt.Fprintln(os.Stderr, "error: --project is required")
+		exitFunc(1)
+		return
+	}
+	apply := hasCloudUpgradeFlag(os.Args[4:], "--apply")
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	defer s.Close()
+	report, err := s.RepairCloudUpgrade(project, apply)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	fmt.Printf("project: %s\n", project)
+	fmt.Printf("class: %s\n", report.Class)
+	fmt.Printf("reason_code: %s\n", report.ReasonCode)
+	fmt.Printf("message: %s\n", report.Message)
+	fmt.Printf("applied: %t\n", report.Applied)
+}
+
+func cmdCloudUpgradeBootstrap(cfg store.Config) {
+	project := parseCloudUpgradeProjectArg(os.Args[4:])
+	if project == "" {
+		fmt.Fprintln(os.Stderr, "usage: engram cloud upgrade bootstrap --project <name> [--resume]")
+		fmt.Fprintln(os.Stderr, "error: --project is required")
+		exitFunc(1)
+		return
+	}
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	defer s.Close()
+
+	cc, err := resolveCloudRuntimeConfig(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	if cc == nil || strings.TrimSpace(cc.ServerURL) == "" {
+		fatal(fmt.Errorf("cloud upgrade bootstrap requires configured cloud server"))
+		return
+	}
+	validatedURL, err := validateCloudServerURL(cc.ServerURL)
+	if err != nil {
+		fatal(fmt.Errorf("invalid cloud runtime server URL: %w", err))
+		return
+	}
+	cc.ServerURL = validatedURL
+	if err := captureUpgradeSnapshotBeforeBootstrap(s, cfg, project); err != nil {
+		fatal(err)
+		return
+	}
+	legacyReport, err := s.DiagnoseCloudUpgradeLegacyMutations(project)
+	if err != nil {
+		fatal(fmt.Errorf("cloud upgrade bootstrap legacy mutation diagnosis: %w", err))
+		return
+	}
+	if legacyReport.BlockedCount > 0 {
+		first := legacyReport.Findings[0]
+		fatal(fmt.Errorf("legacy mutation payloads require manual action before bootstrap (seq=%d entity=%s op=%s): %s", first.Seq, first.Entity, first.Op, first.Message))
+		return
+	}
+	if legacyReport.RepairableCount > 0 {
+		fatal(fmt.Errorf("legacy mutation payloads require repair before bootstrap: run `engram cloud upgrade repair --project %s --apply`", project))
+		return
+	}
+
+	result, err := runUpgradeBootstrap(s, project, cc)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	fmt.Printf("project: %s\n", project)
+	fmt.Printf("stage: %s\n", result.Stage)
+	fmt.Printf("resumed: %t\n", result.Resumed)
+	fmt.Printf("noop: %t\n", result.NoOp)
+}
+
+func captureUpgradeSnapshotBeforeBootstrap(s *store.Store, cfg store.Config, project string) error {
+	state, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		return fmt.Errorf("load cloud upgrade state before bootstrap snapshot: %w", err)
+	}
+	if state != nil {
+		snapshot := state.Snapshot
+		if snapshot.CloudConfigPresent || strings.TrimSpace(snapshot.CloudConfigJSON) != "" || snapshot.ProjectEnrolled {
+			return nil
+		}
+	}
+
+	enrolled, err := s.IsProjectEnrolled(project)
+	if err != nil {
+		return fmt.Errorf("load project enrollment before bootstrap snapshot: %w", err)
+	}
+
+	var snapshot store.CloudUpgradeSnapshot
+	configBytes, err := os.ReadFile(cloudConfigPath(cfg))
+	if err == nil {
+		snapshot.CloudConfigPresent = true
+		snapshot.CloudConfigJSON = string(configBytes)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read cloud config for bootstrap snapshot: %w", err)
+	}
+	snapshot.ProjectEnrolled = enrolled
+
+	next := store.CloudUpgradeState{Project: project, Stage: store.UpgradeStagePlanned, RepairClass: store.UpgradeRepairClassNone, Snapshot: snapshot}
+	if state != nil {
+		next = *state
+		next.Snapshot = snapshot
+	}
+	if err := s.SaveCloudUpgradeState(next); err != nil {
+		return fmt.Errorf("persist pre-bootstrap rollback snapshot: %w", err)
+	}
+	return nil
+}
+
+func cmdCloudUpgradeStatus(cfg store.Config) {
+	project := parseCloudUpgradeProjectArg(os.Args[4:])
+	if project == "" {
+		fmt.Fprintln(os.Stderr, "usage: engram cloud upgrade status --project <name>")
+		fmt.Fprintln(os.Stderr, "error: --project is required")
+		exitFunc(1)
+		return
+	}
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	defer s.Close()
+	state, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	if state == nil {
+		fmt.Printf("project: %s\n", project)
+		fmt.Printf("stage: %s\n", store.UpgradeStagePlanned)
+		return
+	}
+	fmt.Printf("project: %s\n", project)
+	fmt.Printf("stage: %s\n", state.Stage)
+	fmt.Printf("class: %s\n", state.RepairClass)
+	fmt.Printf("reason_code: %s\n", strings.TrimSpace(state.LastErrorCode))
+	fmt.Printf("reason_message: %s\n", strings.TrimSpace(state.LastErrorMessage))
+}
+
+func cmdCloudUpgradeRollback(cfg store.Config) {
+	project := parseCloudUpgradeProjectArg(os.Args[4:])
+	if project == "" {
+		fmt.Fprintln(os.Stderr, "usage: engram cloud upgrade rollback --project <name>")
+		fmt.Fprintln(os.Stderr, "error: --project is required")
+		exitFunc(1)
+		return
+	}
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	defer s.Close()
+	state, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	if state == nil {
+		fatal(fmt.Errorf("rollback requires existing upgrade checkpoint state"))
+		return
+	}
+	canRollback, err := s.CanRollbackCloudUpgrade(project)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	if !canRollback {
+		fmt.Fprintln(os.Stderr, "rollback is unavailable post-bootstrap; use explicit disconnect/unenroll flows")
+		exitFunc(1)
+		return
+	}
+	if state.Snapshot.CloudConfigPresent {
+		if err := os.WriteFile(cloudConfigPath(cfg), []byte(state.Snapshot.CloudConfigJSON), 0o644); err != nil {
+			fatal(err)
+			return
+		}
+	} else {
+		_ = os.Remove(cloudConfigPath(cfg))
+	}
+	rolledBack, err := engramsync.RollbackProject(s, engramsync.UpgradeRollbackOptions{Project: project})
+	if err != nil {
+		fatal(err)
+		return
+	}
+	fmt.Printf("project: %s\n", project)
+	fmt.Printf("stage: %s\n", rolledBack.Stage)
+}
+
+func hasCloudUpgradeFlag(args []string, flag string) bool {
+	for _, arg := range args {
+		if strings.TrimSpace(arg) == flag {
+			return true
+		}
+	}
+	return false
 }
 
 func cmdCloudStatus(cfg store.Config) {
@@ -261,6 +646,7 @@ func cmdCloudServe() {
 
 func validateCloudServeAuthConfig() error {
 	token := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_TOKEN"))
+	adminToken := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_ADMIN"))
 	insecureNoAuth := envBool("ENGRAM_CLOUD_INSECURE_NO_AUTH")
 	allowlist := normalizeAllowedProjects(cloud.ConfigFromEnv().AllowedProjects)
 	jwtSecretEnv := strings.TrimSpace(os.Getenv("ENGRAM_JWT_SECRET"))
@@ -279,6 +665,9 @@ func validateCloudServeAuthConfig() error {
 	if insecureNoAuth {
 		if len(allowlist) == 0 {
 			return fmt.Errorf("cloud project allowlist is required even in insecure mode: set ENGRAM_CLOUD_ALLOWED_PROJECTS to one or more project names")
+		}
+		if adminToken != "" {
+			return fmt.Errorf("ENGRAM_CLOUD_ADMIN is not supported when ENGRAM_CLOUD_INSECURE_NO_AUTH=1; remove ENGRAM_CLOUD_ADMIN or enable authenticated mode")
 		}
 		fmt.Fprintln(os.Stderr, "warning: ENGRAM_CLOUD_INSECURE_NO_AUTH=1 disables cloud API authentication; do not use in production")
 		return nil

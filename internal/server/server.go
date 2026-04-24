@@ -31,14 +31,17 @@ type SyncStatusProvider interface {
 
 // SyncStatus mirrors autosync.Status to avoid a direct import cycle.
 type SyncStatus struct {
-	Enabled             bool       `json:"enabled"`
-	Phase               string     `json:"phase"`
-	LastError           string     `json:"last_error,omitempty"`
-	ConsecutiveFailures int        `json:"consecutive_failures"`
-	BackoffUntil        *time.Time `json:"backoff_until,omitempty"`
-	LastSyncAt          *time.Time `json:"last_sync_at,omitempty"`
-	ReasonCode          string     `json:"reason_code,omitempty"`
-	ReasonMessage       string     `json:"reason_message,omitempty"`
+	Enabled              bool       `json:"enabled"`
+	Phase                string     `json:"phase"`
+	LastError            string     `json:"last_error,omitempty"`
+	ConsecutiveFailures  int        `json:"consecutive_failures"`
+	BackoffUntil         *time.Time `json:"backoff_until,omitempty"`
+	LastSyncAt           *time.Time `json:"last_sync_at,omitempty"`
+	ReasonCode           string     `json:"reason_code,omitempty"`
+	ReasonMessage        string     `json:"reason_message,omitempty"`
+	UpgradeStage         string     `json:"upgrade_stage,omitempty"`
+	UpgradeReasonCode    string     `json:"upgrade_reason_code,omitempty"`
+	UpgradeReasonMessage string     `json:"upgrade_reason_message,omitempty"`
 }
 
 type Server struct {
@@ -587,6 +590,11 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		"last_sync_at":         status.LastSyncAt,
 		"reason_code":          status.ReasonCode,
 		"reason_message":       status.ReasonMessage,
+		"upgrade": map[string]any{
+			"stage":          status.UpgradeStage,
+			"reason_code":    status.UpgradeReasonCode,
+			"reason_message": status.UpgradeReasonMessage,
+		},
 	})
 }
 

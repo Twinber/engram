@@ -86,6 +86,22 @@ func TestAuthorizeProjectScope(t *testing.T) {
 	}
 }
 
+func TestProjectScopeAuthorizerEnforcesAllowlistWithoutJWT(t *testing.T) {
+	authorizer := NewProjectScopeAuthorizer([]string{"proj-a"})
+
+	if err := authorizer.AuthorizeProject("PROJ-A"); err != nil {
+		t.Fatalf("expected normalized project to be allowed, got %v", err)
+	}
+	if err := authorizer.AuthorizeProject("proj-b"); !errors.Is(err, ErrProjectNotAllowed) {
+		t.Fatalf("expected ErrProjectNotAllowed for out-of-scope project, got %v", err)
+	}
+
+	authorizer = NewProjectScopeAuthorizer(nil)
+	if err := authorizer.AuthorizeProject("proj-a"); err == nil {
+		t.Fatal("expected empty allowlist to be rejected")
+	}
+}
+
 func TestDashboardSessionTokenRoundTrip(t *testing.T) {
 	svc, err := NewService(&cloudstore.CloudStore{}, strings.Repeat("x", 32))
 	if err != nil {
@@ -172,5 +188,32 @@ func TestDashboardSessionTokenRejectsWhenConfiguredBearerChanges(t *testing.T) {
 	svc.SetBearerToken("rotated-token")
 	if _, err := svc.ParseDashboardSession(token); !errors.Is(err, ErrInvalidDashboardSessionToken) {
 		t.Fatalf("expected token minted for old bearer to fail after rotation, got %v", err)
+	}
+}
+
+func TestDashboardSessionTokenSupportsAdditionalDashboardCredential(t *testing.T) {
+	svc, err := NewService(&cloudstore.CloudStore{}, strings.Repeat("x", 32))
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+	svc.SetBearerToken("sync-token")
+	svc.SetDashboardSessionTokens([]string{"admin-token"})
+
+	adminSession, err := svc.MintDashboardSession("admin-token")
+	if err != nil {
+		t.Fatalf("mint dashboard admin session: %v", err)
+	}
+
+	parsed, err := svc.ParseDashboardSession(adminSession)
+	if err != nil {
+		t.Fatalf("parse dashboard admin session: %v", err)
+	}
+	if parsed != "admin-token" {
+		t.Fatalf("expected parsed dashboard credential to preserve admin token, got %q", parsed)
+	}
+
+	svc.SetDashboardSessionTokens(nil)
+	if _, err := svc.ParseDashboardSession(adminSession); !errors.Is(err, ErrInvalidDashboardSessionToken) {
+		t.Fatalf("expected admin session to become invalid when additional dashboard credential is removed, got %v", err)
 	}
 }

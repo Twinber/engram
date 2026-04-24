@@ -8,7 +8,7 @@ Engram works with **any MCP-compatible agent**. Pick your agent below.
 >
 > Deferred validation scope for this rollout:
 > - Setup/plugin scripts are **not** yet validated as cloud enrollment/login orchestrators.
-> - `engram setup ...` installs MCP/plugin integrations only; it does **not** auto-run `engram cloud config/enroll`.
+> - `engram setup ...` installs MCP/plugin integrations only; it does **not** auto-run `engram cloud config/enroll/upgrade`.
 > - Cloud onboarding contract remains CLI-first until script-level cloud flows are explicitly implemented.
 
 ## Quick Reference
@@ -24,6 +24,14 @@ Engram works with **any MCP-compatible agent**. Pick your agent below.
 | Cursor | Manual JSON config | [Details](#cursor) |
 | Windsurf | Manual JSON config | [Details](#windsurf) |
 | Any MCP agent | `engram mcp` (stdio) | [Details](#any-other-mcp-agent) |
+
+### Project auto-detection (important)
+
+**Do not pass `project` to write tools.** Engram auto-detects the project from the server's working directory (cwd) using git remote URL, repo root name, or directory basename. Agents that include `project` in `mem_save` or similar calls will have that argument silently discarded.
+
+**Recommended first call:** `mem_current_project` — confirms which project Engram detected before you start writing. Returns `project_source` (how it was detected) and `available_projects` (if cwd is ambiguous).
+
+**Read tools** (`mem_search`, `mem_context`, `mem_get_observation`, `mem_stats`, `mem_timeline`) accept an optional `project` override validated against the store. Omit it to auto-detect.
 
 ---
 
@@ -377,3 +385,47 @@ Save proactively after significant work. After context resets, call mem_context 
 ```
 
 This is the **nuclear option** — system prompts survive everything, including compaction.
+
+---
+
+## Cloud Autosync toggle
+
+`engram serve` and `engram mcp` support continuous background replication to an Engram Cloud server. This is **opt-in** and never fatal on missing config.
+
+### Prerequisites
+
+1. A running Engram Cloud server (see `docker-compose.cloud.yml` or `engram cloud serve`). The server must be a build that includes the mutation endpoints (`POST /sync/mutations/push`, `GET /sync/mutations/pull`). If the server is older, autosync enters `PhaseBackoff` with `reason_code: server_unsupported`.
+
+2. A valid bearer token configured on the server.
+
+### Enable autosync
+
+```sh
+export ENGRAM_CLOUD_AUTOSYNC=1          # exact "1" only
+export ENGRAM_CLOUD_TOKEN=your-token    # bearer token
+export ENGRAM_CLOUD_SERVER=https://cloud.engram.example.com
+
+engram serve
+# or
+engram mcp
+```
+
+The process logs `[autosync] started (server=...)` on success. Missing token or server URL logs `[autosync] ERROR: ...` and the process starts normally without autosync.
+
+---
+
+## Cloud dashboard (templ contributors)
+
+If you are contributing to the cloud dashboard (`internal/cloud/dashboard/`), the HTML components are rendered via [templ](https://templ.guide/). Before committing changes to any `.templ` file, regenerate the Go output:
+
+```sh
+# Download pinned version (first time only)
+go mod download
+
+# Regenerate
+make templ
+# or directly:
+go tool templ generate ./internal/cloud/dashboard/...
+```
+
+Commit the regenerated `components_templ.go`, `layout_templ.go`, and `login_templ.go` alongside your `.templ` source changes. CI will fail if they are missing or outdated (`TestTemplGeneratedFilesAreCheckedIn`).

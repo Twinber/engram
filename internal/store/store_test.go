@@ -1687,6 +1687,359 @@ func TestSyncStateDeterministicReasonCodes(t *testing.T) {
 	}
 }
 
+func TestUpgradeStateSnapshotLifecycle(t *testing.T) {
+	s := newTestStore(t)
+	project := "upgrade-proj"
+
+	initial, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		t.Fatalf("get initial cloud upgrade state: %v", err)
+	}
+	if initial != nil {
+		t.Fatalf("expected nil initial upgrade state, got %+v", initial)
+	}
+
+	snapshot := CloudUpgradeSnapshot{
+		CloudConfigPresent: true,
+		CloudConfigJSON:    `{"server_url":"https://cloud.example.test"}`,
+		ProjectEnrolled:    false,
+	}
+	state := CloudUpgradeState{
+		Project:          project,
+		Stage:            UpgradeStageBootstrapEnrolled,
+		RepairClass:      UpgradeRepairClassRepairable,
+		Snapshot:         snapshot,
+		LastErrorCode:    "upgrade_blocked_manual",
+		LastErrorMessage: "manual fix required",
+	}
+	if err := s.SaveCloudUpgradeState(state); err != nil {
+		t.Fatalf("save upgrade state: %v", err)
+	}
+
+	stored, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		t.Fatalf("get stored cloud upgrade state: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("expected stored upgrade state")
+	}
+	if stored.Stage != UpgradeStageBootstrapEnrolled {
+		t.Fatalf("expected stage %q, got %q", UpgradeStageBootstrapEnrolled, stored.Stage)
+	}
+	if !stored.Snapshot.CloudConfigPresent || stored.Snapshot.CloudConfigJSON == "" {
+		t.Fatalf("expected snapshot to roundtrip, got %+v", stored.Snapshot)
+	}
+
+	allowed, err := s.CanRollbackCloudUpgrade(project)
+	if err != nil {
+		t.Fatalf("can rollback before verification: %v", err)
+	}
+	if !allowed {
+		t.Fatal("expected rollback allowed before bootstrap verification")
+	}
+
+	state.Stage = UpgradeStageBootstrapVerified
+	if err := s.SaveCloudUpgradeState(state); err != nil {
+		t.Fatalf("save verified stage: %v", err)
+	}
+
+	allowed, err = s.CanRollbackCloudUpgrade(project)
+	if err != nil {
+		t.Fatalf("can rollback after verification: %v", err)
+	}
+	if allowed {
+		t.Fatal("expected rollback blocked after bootstrap verification")
+	}
+
+	if err := s.ClearCloudUpgradeState(project); err != nil {
+		t.Fatalf("clear upgrade state: %v", err)
+	}
+
+	afterClear, err := s.GetCloudUpgradeState(project)
+	if err != nil {
+		t.Fatalf("get cleared upgrade state: %v", err)
+	}
+	if afterClear != nil {
+		t.Fatalf("expected nil upgrade state after clear, got %+v", afterClear)
+	}
+}
+
+func TestUpgradeRepairDryRunAndApply(t *testing.T) {
+	t.Run("dry-run is deterministic and non-mutating", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("repair-s1", "repair-proj", "/tmp/repair"); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if _, err := s.AddObservation(AddObservationParams{SessionID: "repair-s1", Type: "decision", Title: "t", Content: "c", Project: "repair-proj", Scope: "project"}); err != nil {
+			t.Fatalf("add observation: %v", err)
+		}
+		if _, err := s.AddPrompt(AddPromptParams{SessionID: "repair-s1", Content: "p", Project: "repair-proj"}); err != nil {
+			t.Fatalf("add prompt: %v", err)
+		}
+		if err := s.EnrollProject("repair-proj"); err != nil {
+			t.Fatalf("enroll project: %v", err)
+		}
+
+		if _, err := s.execHook(s.db, `
+			DELETE FROM sync_mutations
+			WHERE seq IN (
+				SELECT seq FROM sync_mutations WHERE project = ? AND entity = ? ORDER BY seq ASC LIMIT 1
+			)
+		`, "repair-proj", SyncEntityObservation); err != nil {
+			t.Fatalf("delete mutation for repair setup: %v", err)
+		}
+
+		beforeCount := 0
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = ?`, "repair-proj").Scan(&beforeCount); err != nil {
+			t.Fatalf("count before dry-run: %v", err)
+		}
+
+		report1, err := s.RepairCloudUpgrade("repair-proj", false)
+		if err != nil {
+			t.Fatalf("dry-run repair: %v", err)
+		}
+		report2, err := s.RepairCloudUpgrade("repair-proj", false)
+		if err != nil {
+			t.Fatalf("second dry-run repair: %v", err)
+		}
+		if report1 != report2 {
+			t.Fatalf("expected deterministic dry-run report, got %+v and %+v", report1, report2)
+		}
+		if report1.Class != UpgradeRepairClassRepairable {
+			t.Fatalf("expected repairable class, got %+v", report1)
+		}
+
+		afterCount := 0
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM sync_mutations WHERE project = ?`, "repair-proj").Scan(&afterCount); err != nil {
+			t.Fatalf("count after dry-run: %v", err)
+		}
+		if beforeCount != afterCount {
+			t.Fatalf("dry-run must not mutate local state, before=%d after=%d", beforeCount, afterCount)
+		}
+	})
+
+	t.Run("apply backfills safe local fixes", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("repair-s2", "repair-apply", "/tmp/repair-apply"); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if _, err := s.AddObservation(AddObservationParams{SessionID: "repair-s2", Type: "decision", Title: "t", Content: "c", Project: "repair-apply", Scope: "project"}); err != nil {
+			t.Fatalf("add observation: %v", err)
+		}
+		if err := s.EnrollProject("repair-apply"); err != nil {
+			t.Fatalf("enroll project: %v", err)
+		}
+		if _, err := s.execHook(s.db, `
+			DELETE FROM sync_mutations
+			WHERE seq IN (
+				SELECT seq FROM sync_mutations WHERE project = ? AND entity = ? ORDER BY seq ASC LIMIT 1
+			)
+		`, "repair-apply", SyncEntityObservation); err != nil {
+			t.Fatalf("delete mutation for apply setup: %v", err)
+		}
+
+		report, err := s.RepairCloudUpgrade("repair-apply", true)
+		if err != nil {
+			t.Fatalf("apply repair: %v", err)
+		}
+		if report.Class != UpgradeRepairClassRepairable || !report.Applied {
+			t.Fatalf("expected applied repairable result, got %+v", report)
+		}
+
+		pending, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 20)
+		if err != nil {
+			t.Fatalf("list pending mutations: %v", err)
+		}
+		foundObservation := false
+		for _, mutation := range pending {
+			if mutation.Project == "repair-apply" && mutation.Entity == SyncEntityObservation {
+				foundObservation = true
+				break
+			}
+		}
+		if !foundObservation {
+			t.Fatal("expected observation mutation to be backfilled by apply")
+		}
+	})
+
+	t.Run("blocked ambiguity is not auto-mutated", func(t *testing.T) {
+		s := newTestStore(t)
+		report, err := s.RepairCloudUpgrade("unregistered-proj", true)
+		if err != nil {
+			t.Fatalf("blocked repair report: %v", err)
+		}
+		if report.Class != UpgradeRepairClassBlocked || report.Applied {
+			t.Fatalf("expected blocked non-applied report, got %+v", report)
+		}
+	})
+
+	t.Run("auth and policy blockers are manual-action-required", func(t *testing.T) {
+		tests := []struct {
+			name       string
+			reasonCode string
+			message    string
+			wantClass  string
+		}{
+			{name: "auth required", reasonCode: "auth_required", message: "token expired", wantClass: UpgradeRepairClassPolicy},
+			{name: "policy forbidden", reasonCode: "policy_forbidden", message: "project denied by org policy", wantClass: UpgradeRepairClassPolicy},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				s := newTestStore(t)
+				if err := s.MarkSyncBlocked("cloud:repair-policy", tc.reasonCode, tc.message); err != nil {
+					t.Fatalf("seed sync blocked state: %v", err)
+				}
+
+				report, err := s.RepairCloudUpgrade("repair-policy", true)
+				if err != nil {
+					t.Fatalf("repair report: %v", err)
+				}
+				if report.Class != tc.wantClass || report.Applied {
+					t.Fatalf("expected class=%s applied=false, got %+v", tc.wantClass, report)
+				}
+				if !strings.Contains(report.Message, "manual-action-required") {
+					t.Fatalf("expected manual-action-required guidance, got %q", report.Message)
+				}
+			})
+		}
+	})
+
+	t.Run("legacy mutation required fields are detected and repaired from authoritative local state", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("legacy-s1", "legacy-proj", "/tmp/legacy"); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if _, err := s.AddObservation(AddObservationParams{SessionID: "legacy-s1", Type: "decision", Title: "Authoritative title", Content: "Authoritative content", Project: "legacy-proj", Scope: "project"}); err != nil {
+			t.Fatalf("add observation: %v", err)
+		}
+		if err := s.EnrollProject("legacy-proj"); err != nil {
+			t.Fatalf("enroll project: %v", err)
+		}
+
+		var syncID string
+		if err := s.db.QueryRow(`SELECT sync_id FROM observations WHERE session_id = ? ORDER BY id DESC LIMIT 1`, "legacy-s1").Scan(&syncID); err != nil {
+			t.Fatalf("lookup observation sync id: %v", err)
+		}
+
+		payload := `{"sync_id":"` + syncID + `","session_id":"legacy-s1","type":"decision","content":"legacy payload missing title","scope":"project"}`
+		if _, err := s.execHook(s.db,
+			`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			DefaultSyncTargetKey,
+			SyncEntityObservation,
+			syncID,
+			SyncOpUpsert,
+			payload,
+			SyncSourceLocal,
+			"legacy-proj",
+		); err != nil {
+			t.Fatalf("insert malformed legacy mutation: %v", err)
+		}
+
+		diagnosis, err := s.DiagnoseCloudUpgradeLegacyMutations("legacy-proj")
+		if err != nil {
+			t.Fatalf("diagnose legacy mutations: %v", err)
+		}
+		if diagnosis.RepairableCount == 0 || diagnosis.BlockedCount != 0 {
+			t.Fatalf("expected repairable-only diagnosis, got %+v", diagnosis)
+		}
+		if len(diagnosis.Findings) == 0 || !diagnosis.Findings[0].Repairable {
+			t.Fatalf("expected at least one repairable finding, got %+v", diagnosis.Findings)
+		}
+
+		report, err := s.RepairCloudUpgrade("legacy-proj", true)
+		if err != nil {
+			t.Fatalf("repair legacy payload gaps: %v", err)
+		}
+		if report.Class != UpgradeRepairClassRepairable || !report.Applied {
+			t.Fatalf("expected applied repairable result, got %+v", report)
+		}
+
+		var repairedPayload string
+		if err := s.db.QueryRow(`
+			SELECT payload FROM sync_mutations
+			WHERE target_key = ? AND project = ? AND entity = ? AND entity_key = ? AND op = ?
+			ORDER BY seq DESC LIMIT 1
+		`, DefaultSyncTargetKey, "legacy-proj", SyncEntityObservation, syncID, SyncOpUpsert).Scan(&repairedPayload); err != nil {
+			t.Fatalf("load repaired payload: %v", err)
+		}
+		var repaired syncObservationPayload
+		if err := decodeSyncPayload([]byte(repairedPayload), &repaired); err != nil {
+			t.Fatalf("decode repaired payload: %v", err)
+		}
+		if strings.TrimSpace(repaired.Title) == "" {
+			t.Fatalf("expected repaired payload title from authoritative local observation, got %+v", repaired)
+		}
+
+		after, err := s.DiagnoseCloudUpgradeLegacyMutations("legacy-proj")
+		if err != nil {
+			t.Fatalf("diagnose after repair: %v", err)
+		}
+		if after.RepairableCount != 0 || after.BlockedCount != 0 || len(after.Findings) != 0 {
+			t.Fatalf("expected no remaining legacy findings after repair, got %+v", after)
+		}
+	})
+}
+
+func TestRollbackCloudUpgradeSafetyBoundary(t *testing.T) {
+	t.Run("rollback before bootstrap verification restores snapshot enrollment", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.CreateSession("rb-s1", "rb-proj", "/tmp/rb"); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if err := s.EnrollProject("rb-proj"); err != nil {
+			t.Fatalf("seed enrolled project: %v", err)
+		}
+		if err := s.SaveCloudUpgradeState(CloudUpgradeState{
+			Project:     "rb-proj",
+			Stage:       UpgradeStageBootstrapPushed,
+			RepairClass: UpgradeRepairClassRepairable,
+			Snapshot: CloudUpgradeSnapshot{
+				CloudConfigPresent: true,
+				CloudConfigJSON:    `{"server_url":"https://cloud.example.test"}`,
+				ProjectEnrolled:    false,
+			},
+		}); err != nil {
+			t.Fatalf("seed upgrade state: %v", err)
+		}
+
+		rolledBack, err := s.RollbackCloudUpgrade("rb-proj")
+		if err != nil {
+			t.Fatalf("rollback before verification: %v", err)
+		}
+		if rolledBack.Stage != UpgradeStageRolledBack {
+			t.Fatalf("expected rolled_back stage, got %q", rolledBack.Stage)
+		}
+		enrolled, err := s.IsProjectEnrolled("rb-proj")
+		if err != nil {
+			t.Fatalf("verify enrollment: %v", err)
+		}
+		if enrolled {
+			t.Fatal("expected rollback to restore unenrolled snapshot state")
+		}
+	})
+
+	t.Run("rollback after bootstrap verification fails loudly", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.SaveCloudUpgradeState(CloudUpgradeState{
+			Project:     "rb-verified",
+			Stage:       UpgradeStageBootstrapVerified,
+			RepairClass: UpgradeRepairClassReady,
+			Snapshot: CloudUpgradeSnapshot{
+				CloudConfigPresent: true,
+				ProjectEnrolled:    true,
+			},
+		}); err != nil {
+			t.Fatalf("seed verified state: %v", err)
+		}
+
+		_, err := s.RollbackCloudUpgrade("rb-verified")
+		if err == nil || !strings.Contains(err.Error(), "rollback is unavailable post-bootstrap") {
+			t.Fatalf("expected loud post-boundary failure, got %v", err)
+		}
+	})
+}
+
 func TestMarkSyncBlockedResetsConsecutiveFailures(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.MarkSyncFailure(DefaultSyncTargetKey, "transport timeout", time.Now().UTC().Add(30*time.Second)); err != nil {
@@ -5927,5 +6280,134 @@ func TestDeletePrompt_NotFound(t *testing.T) {
 	err := s.DeletePrompt(999999)
 	if !errors.Is(err, ErrPromptNotFound) {
 		t.Fatalf("expected ErrPromptNotFound, got: %v", err)
+	}
+}
+
+// ─── ProjectExists tests (Batch 2 — REQ-315) ─────────────────────────────────
+
+func TestProjectExists_EmptyStore(t *testing.T) {
+	s := newTestStore(t)
+
+	exists, err := s.ProjectExists("any-project")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exists {
+		t.Error("expected false on empty store")
+	}
+}
+
+func TestProjectExists_Known(t *testing.T) {
+	s := newTestStore(t)
+
+	// Insert an observation for the target project.
+	if err := s.CreateSession("sess-1", "my-project", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "sess-1",
+		Type:      "manual",
+		Title:     "test",
+		Content:   "test content",
+		Project:   "my-project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	exists, err := s.ProjectExists("my-project")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exists {
+		t.Error("expected true for known project with observation")
+	}
+}
+
+func TestProjectExists_KnownViaSession(t *testing.T) {
+	s := newTestStore(t)
+
+	// Only a session, no observations.
+	if err := s.CreateSession("sess-only", "session-only-project", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	exists, err := s.ProjectExists("session-only-project")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exists {
+		t.Error("expected true for project with a session only")
+	}
+}
+
+func TestProjectExists_KnownViaPrompt(t *testing.T) {
+	s := newTestStore(t)
+
+	// Only a prompt, no session or observation.
+	if err := s.CreateSession("sess-prompt", "prompt-only-project", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	_, err := s.AddPrompt(AddPromptParams{
+		SessionID: "sess-prompt",
+		Content:   "what is this?",
+		Project:   "prompt-only-project",
+	})
+	if err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	exists, err := s.ProjectExists("prompt-only-project")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exists {
+		t.Error("expected true for project with a prompt only")
+	}
+}
+
+func TestProjectExists_Unknown(t *testing.T) {
+	s := newTestStore(t)
+
+	// Populate with a different project.
+	if err := s.CreateSession("sess-other", "other-project", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "sess-other",
+		Type:      "manual",
+		Title:     "other",
+		Content:   "other content",
+		Project:   "other-project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	exists, err := s.ProjectExists("does-not-exist")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exists {
+		t.Error("expected false for unknown project in populated store")
+	}
+}
+
+// TestProjectExists_KnownViaEnrollmentOnly: a project enrolled via EnrollProject()
+// with no observations/sessions/prompts must still be found by ProjectExists (JC1).
+func TestProjectExists_KnownViaEnrollmentOnly(t *testing.T) {
+	s := newTestStore(t)
+
+	// Enroll a project — no observations, sessions, or prompts.
+	if err := s.EnrollProject("enrolled-only-project"); err != nil {
+		t.Fatalf("EnrollProject: %v", err)
+	}
+
+	exists, err := s.ProjectExists("enrolled-only-project")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exists {
+		t.Error("enrolled-only-project must be found via sync_enrolled_projects UNION ALL branch")
 	}
 }

@@ -23,9 +23,14 @@ var ErrProjectNotAllowed = errors.New("project is not allowed for this token")
 type Service struct {
 	store         *cloudstore.CloudStore
 	expectedToken string
+	dashboardAuth map[string]struct{}
 	allowed       map[string]struct{}
 	jwtSecret     []byte
 	now           func() time.Time
+}
+
+type ProjectScopeAuthorizer struct {
+	allowed map[string]struct{}
 }
 
 func NewService(store *cloudstore.CloudStore, jwtSecret string) (*Service, error) {
@@ -33,6 +38,12 @@ func NewService(store *cloudstore.CloudStore, jwtSecret string) (*Service, error
 		return nil, ErrSecretTooShort
 	}
 	return &Service{store: store, jwtSecret: []byte(jwtSecret), now: time.Now}, nil
+}
+
+func NewProjectScopeAuthorizer(projects []string) *ProjectScopeAuthorizer {
+	a := &ProjectScopeAuthorizer{allowed: make(map[string]struct{})}
+	a.SetAllowedProjects(projects)
+	return a
 }
 
 type dashboardSessionClaims struct {
@@ -96,10 +107,19 @@ func (s *Service) ParseDashboardSession(sessionToken string) (string, error) {
 	if expectedToken == "" {
 		return "", ErrBearerTokenNotConfigured
 	}
-	if !hmac.Equal([]byte(claims.TokenHash), []byte(s.dashboardTokenHash(expectedToken))) {
-		return "", ErrInvalidDashboardSessionToken
+	if hmac.Equal([]byte(claims.TokenHash), []byte(s.dashboardTokenHash(expectedToken))) {
+		return expectedToken, nil
 	}
-	return expectedToken, nil
+	for token := range s.dashboardAuth {
+		token = strings.TrimSpace(token)
+		if token == "" || token == expectedToken {
+			continue
+		}
+		if hmac.Equal([]byte(claims.TokenHash), []byte(s.dashboardTokenHash(token))) {
+			return token, nil
+		}
+	}
+	return "", ErrInvalidDashboardSessionToken
 }
 
 func (s *Service) sign(payloadPart string) []byte {
@@ -119,6 +139,17 @@ func (s *Service) SetBearerToken(token string) {
 	s.expectedToken = strings.TrimSpace(token)
 }
 
+func (s *Service) SetDashboardSessionTokens(tokens []string) {
+	s.dashboardAuth = make(map[string]struct{})
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		s.dashboardAuth[token] = struct{}{}
+	}
+}
+
 func (s *Service) SetAllowedProjects(projects []string) {
 	s.allowed = make(map[string]struct{})
 	for _, project := range projects {
@@ -132,7 +163,27 @@ func (s *Service) SetAllowedProjects(projects []string) {
 }
 
 func (s *Service) AuthorizeProject(project string) error {
-	if len(s.allowed) == 0 {
+	return authorizeProjectAgainstAllowlist(project, s.allowed)
+}
+
+func (a *ProjectScopeAuthorizer) SetAllowedProjects(projects []string) {
+	a.allowed = make(map[string]struct{})
+	for _, project := range projects {
+		normalized, _ := store.NormalizeProject(project)
+		normalized = strings.TrimSpace(normalized)
+		if normalized == "" {
+			continue
+		}
+		a.allowed[normalized] = struct{}{}
+	}
+}
+
+func (a *ProjectScopeAuthorizer) AuthorizeProject(project string) error {
+	return authorizeProjectAgainstAllowlist(project, a.allowed)
+}
+
+func authorizeProjectAgainstAllowlist(project string, allowed map[string]struct{}) error {
+	if len(allowed) == 0 {
 		return fmt.Errorf("cloud project allowlist is not configured")
 	}
 	normalized, _ := store.NormalizeProject(project)
@@ -140,7 +191,7 @@ func (s *Service) AuthorizeProject(project string) error {
 	if normalized == "" {
 		return fmt.Errorf("project is required")
 	}
-	if _, ok := s.allowed[normalized]; ok {
+	if _, ok := allowed[normalized]; ok {
 		return nil
 	}
 	return fmt.Errorf("%w", ErrProjectNotAllowed)
