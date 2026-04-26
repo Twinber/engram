@@ -624,7 +624,13 @@ func TestHandleDeleteSession_HasObservations(t *testing.T) {
 	}
 }
 
-func TestHandleDeleteSession_BlockedWhenProjectIsCloudEnrolled(t *testing.T) {
+// TestHandleDeleteSession_PropagatesWhenProjectIsCloudEnrolled verifies the
+// behavior introduced by 71fa9fe: deleting a session whose project is enrolled
+// for cloud sync now succeeds locally AND enqueues a delete mutation so the
+// cloud replicas remove the session too. Previously this returned 409 to
+// prevent local/cloud divergence, but propagating the delete is the
+// correct semantic now that the sync transport supports session/delete ops.
+func TestHandleDeleteSession_PropagatesWhenProjectIsCloudEnrolled(t *testing.T) {
 	st := newServerTestStore(t)
 	srv := New(st, 0)
 	h := srv.Handler()
@@ -640,11 +646,11 @@ func TestHandleDeleteSession_BlockedWhenProjectIsCloudEnrolled(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("expected 409 when cloud-enrolled session delete is blocked, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 when cloud-enrolled session delete propagates, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "blocked") || !strings.Contains(rec.Body.String(), "cloud") {
-		t.Fatalf("expected cloud-blocked delete error message, got %q", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "deleted") {
+		t.Fatalf("expected deleted status in body, got %q", rec.Body.String())
 	}
 }
 

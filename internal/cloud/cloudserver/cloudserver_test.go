@@ -829,7 +829,9 @@ func TestHandlerPushRejectsUnsupportedMutationEntityOp(t *testing.T) {
 	st := &fakeStore{}
 	srv := New(st, fakeAuth{}, 0)
 
-	body := bytes.NewBufferString(`{"project":"proj-a","created_by":"tester","data":{"mutations":[{"entity":"session","entity_key":"s-1","op":"delete","payload":"{\"id\":\"s-1\",\"project\":\"wrong\"}"}]}}`)
+	// session/delete became supported in 71fa9fe (propagate session deletes).
+	// Use an entity that remains unsupported so the rejection path is exercised.
+	body := bytes.NewBufferString(`{"project":"proj-a","created_by":"tester","data":{"mutations":[{"entity":"unknown","entity_key":"x-1","op":"upsert","payload":"{\"id\":\"x-1\"}"}]}}`)
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/sync/push", body))
 
