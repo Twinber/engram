@@ -121,4 +121,4 @@ If you see a message about compaction or context reset:
 3. Only THEN continue working
 
 Do not skip step 1. Without it, everything done before compaction is lost from memory.
-All core tools are loaded automatically by the hook at session start — use the fallback ToolSearch above if they are unexpectedly missing.
+All core tools are loaded automatically by the hook at session start. If they are unexpectedly missing, rerun `engram setup claude-code` and restart Claude Code.
