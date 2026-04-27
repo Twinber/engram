@@ -127,6 +127,14 @@ engram sync --cloud --project smoke-project
 Cloud mode is always project-scoped (`--project` is required; `engram sync --cloud --all` is intentionally blocked).
 Known repairable cloud sync/upsert/canonicalization failures keep the original error visible and recommend the explicit `doctor`/`repair` flow below; Engram never auto-applies repair from sync or autosync.
 
+**After upgrading `engram` while an MCP client is already running:**
+
+```bash
+engram setup claude-code
+```
+
+Then restart Claude Code so it reloads the Engram MCP subprocess and refreshed hook/config files. Updating the `engram` binary on disk does not replace an already-running stdio MCP process.
+
 **Upgrade flow for existing local databases** (diagnose → repair → bootstrap → status):
 
 ```bash
