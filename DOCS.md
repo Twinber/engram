@@ -1,66 +1,38 @@
-# Engram
+[← Back to README](README.md)
+
+# Engram — Technical Reference
 
 **Persistent memory for AI coding agents**
 
-> *Engram* is a neuroscience term for the physical trace of a memory in the brain.
-
-## What is Engram?
-
-An agent-agnostic persistent memory system. A Go binary with SQLite + FTS5 full-text search, exposed via CLI, HTTP API, and MCP server. Thin adapter plugins connect it to specific agents (OpenCode, Claude Code, Cursor, Windsurf, etc.).
-
-**Why Go?** Single binary, cross-platform, no runtime dependencies. Uses `modernc.org/sqlite` (pure Go, no CGO).
-
-- **Module**: `github.com/alanbuscaglia/engram`
-- **Version**: 0.1.0
+This is the complete technical reference for Engram. For getting started, see the [README](README.md). For per-agent setup, see [Agent Setup](docs/AGENT-SETUP.md).
 
 ---
 
-## Architecture
+## Quick Navigation
 
-The Go binary is the brain. Thin adapter plugins per-agent talk to it via HTTP or MCP stdio.
+| Section | What you'll find |
+|---------|-----------------|
+| [Database Schema](#database-schema) | Tables, FTS5, SQLite config |
+| [HTTP API](#http-api-endpoints) | All REST endpoints with request/response details |
+| [MCP Tools](#mcp-tools-17-tools) | Detailed reference for all 17 memory tools |
+| [MCP Project Resolution](#mcp-project-resolution) | Auto-detection algorithm, response envelope, tool categories |
+| [Memory Protocol](#memory-protocol) | When/how agents should use the tools |
+| [Project Name Normalization](#project-name-normalization) | Auto-detection, normalization, similar-project warnings |
+| [Features](#features) | FTS5 search, timeline, privacy, git sync, compression |
+| [TUI](#terminal-ui-tui) | Screens, navigation, architecture |
+| [Running as a Service](#running-as-a-service) | systemd setup |
+| [Design Decisions](#design-decisions) | Why Go, why SQLite, why no auto-capture |
 
-```
-Agent (OpenCode/Claude Code/Cursor/etc.)
-    ↓ (plugin or MCP)
-Engram Go Binary
-    ↓
-SQLite + FTS5 (~/.engram/engram.db)
-```
+For other docs:
 
-Six interfaces:
-
-1. **CLI** — Direct terminal usage (`engram search`, `engram save`, etc.)
-2. **HTTP API** — REST API on port 7437 for plugins and integrations
-3. **MCP Server** — stdio transport for any MCP-compatible agent
-4. **TUI** — Interactive terminal UI for browsing memories (`engram tui`)
-
----
-
-## Project Structure
-
-```
-engram/
-├── cmd/engram/main.go              # CLI entrypoint — all commands
-├── internal/
-│   ├── store/store.go              # Core: SQLite + FTS5 + all data operations
-│   ├── server/server.go            # HTTP REST API server (port 7437)
-│   ├── mcp/mcp.go                  # MCP stdio server (15 tools)
-│   ├── project/                     # Project name detection + similarity matching
-│   │   └── project.go              # DetectProject, FindSimilar, Levenshtein
-│   ├── sync/sync.go                # Git sync: manifest + chunks (gzipped JSONL)
-│   └── tui/                        # Bubbletea terminal UI
-│       ├── model.go                # Screen constants, Model struct, Init(), custom messages
-│       ├── styles.go               # Lipgloss styles (Catppuccin Mocha palette)
-│       ├── update.go               # Update(), handleKeyPress(), per-screen handlers
-│       └── view.go                 # View(), per-screen renderers
-├── skills/
-│   └── gentleman-bubbletea/
-│       └── SKILL.md                # Bubbletea TUI patterns reference
-├── DOCS.md
-├── go.mod
-├── go.sum
-└── .gitignore
-```
+| Doc | Description |
+|-----|-------------|
+| [Installation](docs/INSTALLATION.md) | All install methods + platform support |
+| [Engram Cloud](docs/engram-cloud/README.md) | Cloud landing page, quickstart path, branding, and reference links |
+| [Agent Setup](docs/AGENT-SETUP.md) | Per-agent configuration + compaction survival |
+| [Architecture](docs/ARCHITECTURE.md) | How it works, session lifecycle, CLI reference, project structure |
+| [Plugins](docs/PLUGINS.md) | OpenCode & Claude Code plugin details |
+| [Comparison](docs/COMPARISON.md) | Why Engram vs claude-mem |
 
 ---
 
@@ -73,7 +45,7 @@ engram/
 - **observations_fts** — FTS5 virtual table synced via triggers (`title`, `content`, `tool_name`, `type`, `project`)
 - **user_prompts** — `id` (INTEGER PK AUTOINCREMENT), `session_id` (FK), `content`, `project`, `created_at`
 - **prompts_fts** — FTS5 virtual table synced via triggers (`content`, `project`)
-- **sync_chunks** — `chunk_id` (TEXT PK), `imported_at` — tracks which chunks have been imported to prevent duplicates
+- **sync_chunks** — `target_key` (TEXT), `chunk_id` (TEXT), `imported_at`; composite PK (`target_key`, `chunk_id`) for target-scoped chunk tracking
 
 ### SQLite Configuration
 
@@ -84,137 +56,70 @@ engram/
 
 ---
 
-## CLI Commands
-
-```
-engram serve [port]       Start HTTP API server (default: 7437)
-engram mcp                Start MCP server (stdio transport)
-engram tui                Launch interactive terminal UI
-engram search <query>     Search memories [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N]
-engram save <title> <msg> Save a memory [--type TYPE] [--project PROJECT] [--scope SCOPE] [--topic TOPIC_KEY]
-engram timeline <obs_id>  Show chronological context around an observation [--before N] [--after N]
-engram context [project]  Show recent context from previous sessions
-engram stats              Show memory system statistics
-engram export [file]      Export all memories to JSON (default: engram-export.json)
-engram import <file>      Import memories from a JSON export file
-engram sync               Export new memories as chunk [--import] [--status] [--project NAME] [--all]
-engram projects list      Show all projects with obs/session/prompt counts
-engram projects consolidate  Interactive merge of similar project names [--all] [--dry-run]
-engram projects prune     Remove projects with 0 observations [--dry-run]
-engram version            Print version
-engram help               Show help
-```
-
-### Environment Variables
-
-| Variable | Description | Default |
-|---|---|---|
-| `ENGRAM_DATA_DIR` | Override data directory | `~/.engram` |
-| `ENGRAM_PORT` | Override HTTP server port | `7437` |
-| `ENGRAM_PROJECT` | Override project name for MCP server | auto-detected via git |
-
----
-
-## Running as a Service
-
-### Using systemd
-
-First you need add your engram binary to use in a global way. By example: `/usr/bin`, `/usr/local/bin` or `~/.local/bin`.
-In this documentation we will use `~/.local/bin`.
-
-1. First, move binary to `~/.local/bin` (Check if this is in your $PATH variable).
-2. Create a directory for you service with user scope and engram data: `mkdir -p ~/.engram ~/.config/systemd/user`.
-3. Create your service file in the following path: `~/.config/systemd/user/engram.service`.
-4. Reload service list: `systemctl --user daemon-reload`.
-5. Enable your service: `systemctl --user enable engram`.
-6. Then start it: `systemctl --user start engram`.
-7. And finally check the logs: `journalctl --user -u engram -f`.
-
-The following code is an example of the `~/.config/systemd/user/engram.service` file:
-
-```shell
-[Unit]
-Description=Engram Memory Server
-After=network.target
-
-[Service]
-WorkingDirectory=%h
-ExecStart=%h/.local/bin/engram serve
-Restart=always
-RestartSec=3
-Environment=ENGRAM_DATA_DIR=%h/.engram
-
-[Install]
-WantedBy=default.target
-```
-
----
-
-## Terminal UI (TUI)
-
-Interactive Bubbletea-based terminal UI. Launch with `engram tui`.
-
-Built with [Bubbletea](https://github.com/charmbracelet/bubbletea) v1, [Lipgloss](https://github.com/charmbracelet/lipgloss), and [Bubbles](https://github.com/charmbracelet/bubbles) components. Follows the Gentleman Bubbletea skill patterns.
-
-### Screens
-
-| Screen | Description |
-|---|---|
-| **Dashboard** | Stats overview (sessions, observations, prompts, projects) + menu |
-| **Search** | FTS5 text search with text input |
-| **Search Results** | Browsable results list from search |
-| **Recent Observations** | Browse all observations, newest first |
-| **Observation Detail** | Full content of a single observation, scrollable |
-| **Timeline** | Chronological context around an observation (before/after) |
-| **Sessions** | Browse all sessions |
-| **Session Detail** | Observations within a specific session |
-
-### Navigation
-
-- `j/k` or `↑/↓` — Navigate lists
-- `Enter` — Select / drill into detail
-- `t` — View timeline for selected observation
-- `s` or `/` — Quick search from any screen
-- `Esc` or `q` — Go back / quit
-- `Ctrl+C` — Force quit
-
-### Visual Features
-
-- **Catppuccin Mocha** color palette
-- **`(active)` badge** — shown next to sessions and observations from active (non-completed) sessions, sorted to the top of every list
-- **Scroll indicators** — shows position in long lists (e.g. "showing 1-20 of 50")
-- **2-line items** — each observation shows title + content preview
-
-### Architecture (Gentleman Bubbletea patterns)
-
-- `model.go` — Screen constants as `Screen int` iota, single `Model` struct holds ALL state
-- `styles.go` — Lipgloss styles organized by concern (layout, dashboard, list, detail, timeline, search)
-- `update.go` — `Update()` with type switch, `handleKeyPress()` routes to per-screen handlers, each returns `(tea.Model, tea.Cmd)`
-- `view.go` — `View()` routes to per-screen renderers, shared `renderObservationListItem()` for consistent list formatting
-
-### Store Methods (TUI-specific)
-
-The TUI uses dedicated store methods that don't filter by session status (unlike `RecentSessions`/`RecentObservations` which only show completed sessions for MCP context injection):
-
-- `AllSessions()` — All sessions regardless of status, active sorted first
-- `AllObservations()` — All observations regardless of session status, active sorted first
-- `SessionObservations(sessionID)` — All observations for a specific session, chronological order
-
----
-
 ## HTTP API Endpoints
 
-All endpoints return JSON. Server listens on `127.0.0.1:7437`.
+Engram exposes two different runtimes. Keep routes split by runtime:
+
+- **Local runtime (`engram serve`, JSON on `127.0.0.1:7437`)**
+  - includes memory CRUD/search/context endpoints documented below
+  - includes `GET /sync/status` (local node sync status)
+- **Cloud runtime (`engram cloud serve`)**
+  - `GET /health` (cloud service health)
+  - `GET /sync/pull`, `GET /sync/pull/{chunkID}`, `POST /sync/push` (cloud sync transport)
+  - `GET /dashboard/*` HTML routes (browser dashboard)
+
+Dashboard route tree (`engram cloud serve`):
+
+- Public
+  - `GET /dashboard/health` — dashboard subsystem health
+  - `GET /dashboard/login` — login surface (authenticated mode), redirects to `/dashboard/` when already authenticated
+  - `POST /dashboard/login` — login submit (authenticated mode), redirect-only no-op in insecure mode
+  - `POST /dashboard/logout` — clear session cookie and redirect to login
+  - `GET /dashboard/static/*` — embedded CSS/JS assets
+- Protected (requires dashboard session in authenticated mode; open in insecure mode)
+  - `GET /dashboard` and `GET /dashboard/` — dashboard overview
+  - `GET /dashboard/stats`
+  - `GET /dashboard/activity`
+  - `GET /dashboard/browser`
+  - `GET /dashboard/browser/observations` (`HX-Request: true` returns fragment; plain GET returns full page)
+  - `GET /dashboard/browser/sessions` (`HX-Request: true` returns fragment; plain GET returns full page)
+  - `GET /dashboard/browser/sessions/{sessionID}`
+  - `GET /dashboard/browser/prompts` (`HX-Request: true` returns fragment; plain GET returns full page)
+  - `GET /dashboard/projects`
+  - `GET /dashboard/projects/list` — HTMX partial; paginated project list with "Paused" badges
+  - `GET /dashboard/projects/{project}`
+  - `GET /dashboard/projects/{name}/observations` — HTMX partial for project detail
+  - `GET /dashboard/projects/{name}/sessions` — HTMX partial for project detail
+  - `GET /dashboard/projects/{name}/prompts` — HTMX partial for project detail
+  - `GET /dashboard/contributors`
+  - `GET /dashboard/contributors/list` — HTMX partial; paginated contributor list
+  - `GET /dashboard/contributors/{contributor}`
+  - `GET /dashboard/admin` (also requires admin token/session)
+  - `GET /dashboard/admin/projects`
+  - `GET /dashboard/admin/users` (admin-gated)
+  - `GET /dashboard/admin/users/list` (admin-gated; HTMX partial)
+  - `GET /dashboard/admin/health` (admin-gated)
+  - `POST /dashboard/admin/projects/{name}/sync` (admin-gated; toggle sync enabled/disabled)
+  - `GET /dashboard/sessions/{project}/{sessionID}` — session detail with observations + prompts sub-lists
+  - `GET /dashboard/observations/{project}/{sessionID}/{syncID}` — observation detail
+  - `GET /dashboard/prompts/{project}/{sessionID}/{syncID}` — prompt detail
+
+Engram is local-first: local SQLite is authoritative; cloud features are optional replication/shared access and enrollment controls.
 
 ### Health
 
-- `GET /health` — Returns `{"status": "ok", "service": "engram", "version": "0.1.0"}`
+- `GET /health` — Returns `{"status": "ok", "service": "engram", "version": "<current>"}`
 
 ### Sessions
 
 - `POST /sessions` — Create session. Body: `{id, project, directory}`
 - `POST /sessions/{id}/end` — End session. Body: `{summary}`
 - `GET /sessions/recent` — Recent sessions. Query: `?project=X&limit=N`
+- `DELETE /sessions/{id}` — Delete session
+  - `200` when deleted
+  - `404` when session does not exist
+  - `409` when session still has observations (delete/migrate observations first)
+  - `409` when the session's project is enrolled for cloud sync (session deletion is blocked to avoid local/cloud divergence)
 
 ### Observations
 
@@ -223,6 +128,8 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 - `GET /observations/{id}` — Get single observation by ID
 - `PATCH /observations/{id}` — Update fields. Body: `{title?, content?, type?, project?, scope?, topic_key?}`
 - `DELETE /observations/{id}` — Delete observation (`?hard=true` for hard delete, soft delete by default)
+  - `200` when deleted
+  - `404` when observation does not exist
 
 ### Search
 
@@ -237,26 +144,261 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 - `POST /prompts` — Save user prompt. Body: `{session_id, content, project?}`
 - `GET /prompts/recent` — Recent prompts. Query: `?project=X&limit=N`
 - `GET /prompts/search` — Search prompts. Query: `?q=QUERY&project=X&limit=N`
+- `DELETE /prompts/{id}` — Delete prompt
+  - `200` when deleted
+  - `400` for invalid prompt id
+  - `404` when prompt does not exist
 
 ### Context
 
 - `GET /context` — Formatted context. Query: `?project=X&scope=project|personal`
 
+### Passive Capture
+
+- `POST /observations/passive` — Extract structured learnings from text. Body: `{content, session_id, project?}`
+
 ### Export / Import
 
 - `GET /export` — Export all data as JSON
+  - Optional `?project=<name>` for project-scoped export
+  - `400` when `project` is provided but blank/whitespace
 - `POST /import` — Import data from JSON. Body: ExportData JSON
 
 ### Stats
 
 - `GET /stats` — Memory statistics
 
-### Sync Status
+### Project Migration
 
+- `POST /projects/migrate` — Migrate observations between project names. Body: `{old_project, new_project}`
+
+### Sync Status (local runtime only)
+
+- `GET /sync/status` — Runtime sync-state status for the local node (`engram serve` only).
+- In `engram serve`, sync status is wired to persisted SQLite sync state (project-scoped for detected/current project).
+- Response fields when provider is injected:
+  - `enabled`
+  - `phase`
+  - `last_error`
+  - `consecutive_failures`
+  - `backoff_until`
+  - `last_sync_at`
+  - `reason_code`
+  - `reason_message`
+  - `upgrade` (nested object)
+    - `stage`
+    - `reason_code`
+    - `reason_message`
+- `enabled` semantics:
+  - `true` when cloud runtime is configured for the resolved + enrolled project, or when meaningful persisted sync state exists for that resolved project while runtime is not configured.
+  - `false` when no explicit project scope resolves, cloud runtime is malformed/missing, or enrollment/status checks fail.
+- Generic/embedded local server usage may return the fallback `enabled=false` response if no provider is injected.
+
+### Environment Variables
+
+| Variable | Description | Default |
+|---|---|---|
+| `ENGRAM_DATA_DIR` | Override data directory | `~/.engram` |
+| `ENGRAM_PORT` | Override HTTP server port | `7437` |
+| `ENGRAM_PROJECT` | Override project name for MCP server | auto-detected via git |
+
+### Cloud CLI (opt-in)
+
+- `engram cloud status` — show current cloud config state plus auth/sync readiness without mutating local state
+- `engram cloud enroll <project>` — enroll one project for cloud replication
+- `engram cloud config --server <url>` — persist cloud server URL to `~/.engram/cloud.json`
+- `engram cloud serve` — run cloud backend API + dashboard (`/dashboard`) using Postgres config from env
+- `engram cloud upgrade doctor --project <project>` — deterministic read-only readiness diagnosis (`ready|blocked`, class/reason)
+- `engram cloud upgrade repair --project <project> [--dry-run|--apply]` — deterministic local-safe repair planner/apply (no remote mutation)
+- `engram cloud upgrade bootstrap --project <project> [--resume]` — resumable checkpointed enroll/push/verify flow
+- `engram cloud upgrade status --project <project>` — show upgrade stage/class/reason
+- `engram cloud upgrade rollback --project <project>` — restore pre-upgrade local snapshot before `bootstrap_verified`; blocked afterwards
+
+Cloud auth token is provided at runtime via `ENGRAM_CLOUD_TOKEN` (not by a dedicated CLI subcommand).
+Cloud server startup fails closed when the token is missing unless `ENGRAM_CLOUD_INSECURE_NO_AUTH=1` is explicitly set for local insecure development.
+`ENGRAM_CLOUD_INSECURE_NO_AUTH=1` cannot be combined with `ENGRAM_CLOUD_TOKEN`.
+Cloud server always requires `ENGRAM_CLOUD_ALLOWED_PROJECTS` (comma-separated), including insecure mode, so project scope remains server-enforced.
+`ENGRAM_CLOUD_TOKEN` + `ENGRAM_CLOUD_ALLOWED_PROJECTS` are server-side requirements for authenticated mode and must be configured before `engram cloud serve` (or compose startup).
+Authenticated mode also requires an explicit non-default `ENGRAM_JWT_SECRET`; implicit development defaults are rejected.
+Dashboard requests support browser login in authenticated mode: use `/dashboard/login` to exchange the bearer token for an HttpOnly dashboard cookie scoped to `/dashboard`. Protected `/dashboard/*` HTML routes require that cookie and do **not** treat raw `Authorization: Bearer ...` headers as an authenticated browser session. Sync API routes (`/sync/pull`, `/sync/push`) remain header-auth only. In insecure mode (`ENGRAM_CLOUD_INSECURE_NO_AUTH=1` + no `ENGRAM_CLOUD_TOKEN`), dashboard auth is bypassed and `/dashboard/login` redirects to `/dashboard/`.
+
+`ENGRAM_CLOUD_ADMIN` is optional in authenticated mode; when set, `/dashboard/admin` is allowed only for sessions established with that exact token.
+`ENGRAM_CLOUD_ADMIN` is rejected in insecure mode (`ENGRAM_CLOUD_INSECURE_NO_AUTH=1`) to avoid an incoherent admin/browser auth path.
+
+Cloud runtime bind host is controlled by `ENGRAM_CLOUD_HOST`:
+- default: `127.0.0.1` (local-only, safer default)
+- container/compose: set `ENGRAM_CLOUD_HOST=0.0.0.0` so published host ports can reach the cloud server
+
+Cloud runtime envs for `engram cloud serve`:
+
+| Variable | Required | Notes |
+|---|---|---|
+| `ENGRAM_DATABASE_URL` | yes | Postgres DSN for cloud chunk storage/dashboard read model |
+| `ENGRAM_PORT` | no | Runtime port (default `8080`) |
+| `ENGRAM_CLOUD_HOST` | no | Bind host (default `127.0.0.1`; use `0.0.0.0` for containers) |
+| `ENGRAM_CLOUD_ALLOWED_PROJECTS` | yes | Comma-separated allowlist; always required (authenticated + insecure modes) |
+| `ENGRAM_CLOUD_TOKEN` | yes (authenticated mode) | Enables bearer auth mode |
+| `ENGRAM_JWT_SECRET` | yes (authenticated mode) | Must be explicitly set and non-default when token mode is enabled |
+| `ENGRAM_CLOUD_INSECURE_NO_AUTH` | no | Set to `1` only for local insecure mode; cannot be combined with `ENGRAM_CLOUD_TOKEN` |
+| `ENGRAM_CLOUD_ADMIN` | no | Optional admin dashboard token in authenticated mode; rejected in insecure mode |
+
+Cloud sync is still local-first and explicit:
+
+```bash
+# Explicit cloud sync call
+engram sync --cloud --project my-project
+
+# Optional env toggle for cloud mode in sync command
+ENGRAM_CLOUD_SYNC=1 engram sync --status --project my-project
+```
+
+When `engram sync --cloud --project <project>` or autosync hits a known repairable cloud sync/upsert/canonicalization failure, Engram preserves the original error and appends guidance to run:
+
+```bash
+engram cloud upgrade doctor --project <project>
+engram cloud upgrade repair --project <project> --dry-run
+engram cloud upgrade repair --project <project> --apply
+engram sync --cloud --project <project>
+```
+
+Sync/autosync never auto-applies repairs; only the explicit `repair --apply` command mutates local repairable upgrade state.
+
+### Local Cloud Bring-Up (Docker + Postgres)
+
+```bash
+# 1) SERVER-SIDE startup requirements (configure before startup)
+# docker-compose.cloud.yml includes defaults for browser-demo smoke usage:
+# ENGRAM_CLOUD_INSECURE_NO_AUTH=1
+# ENGRAM_CLOUD_ALLOWED_PROJECTS=smoke-project
+docker compose -f docker-compose.cloud.yml up -d
+
+# source-run flow (without compose): set BOTH token + allowlist before startup
+# ENGRAM_DATABASE_URL="postgres://engram:engram_dev@127.0.0.1:5433/engram_cloud?sslmode=disable" \
+# ENGRAM_JWT_SECRET="replace-with-32+-byte-random-secret" \
+# ENGRAM_CLOUD_TOKEN="your-token" \
+# ENGRAM_CLOUD_ALLOWED_PROJECTS="my-project" \
+# engram cloud serve
+
+# 2) CLIENT-SIDE CLI setup
+# compose runtime flow: published :18080
+engram cloud config --server http://127.0.0.1:18080
+# compose runtime default is insecure local-dev mode; keep token unset
+# client sync preflight only requires the configured cloud server URL; no
+# client-side ENGRAM_CLOUD_INSECURE_NO_AUTH flag is required for compose flow
+unset ENGRAM_CLOUD_TOKEN
+
+# 3) Enroll project + run explicit cloud sync
+engram cloud enroll smoke-project
+engram cloud upgrade doctor --project smoke-project
+engram cloud upgrade repair --project smoke-project --dry-run
+engram cloud upgrade repair --project smoke-project --apply
+engram cloud upgrade bootstrap --project smoke-project --resume
+engram cloud upgrade status --project smoke-project
+engram sync --cloud --status --project smoke-project
+
+# source-run client endpoint (without compose): default :8080
+# engram cloud config --server http://127.0.0.1:8080
+
+# cloud mode enforces a single explicit project scope
+# engram sync --cloud --all  # blocked by design
+```
+
+Deterministic reason codes shared across store/CLI/server:
+
+- `blocked_unenrolled`
+- `auth_required`
+- `cloud_config_error`
+- `policy_forbidden`
+- `paused`
+- `transport_failed`
+
+### Cloud Status Visibility Matrix
+
+Cloud failure visibility must stay deterministic across supported surfaces:
+
+| Scenario | Expected deterministic reason | Surfaces |
+|---|---|---|
+| Unconfigured cloud sync preflight (missing server URL) | `cloud_config_error` | CLI stderr |
+| Cloud runtime not configured in status provider (takes precedence even if project scope is unresolved) | `cloud_not_configured` | `/sync/status` |
+| `/sync/status` project cannot be resolved (no query/default project) while cloud runtime is configured | `project_required` | `/sync/status` |
+| Unenrolled project cloud sync | `blocked_unenrolled` | CLI stderr + `/sync/status` |
+| Runtime auth/policy failure from remote API | `auth_required` / `policy_forbidden` | CLI stderr + `/sync/status` |
+| Explicit paused state | `paused` | `/sync/status` |
+| Remote/network failure | `transport_failed` | CLI stderr + `/sync/status` |
+
+`engram sync --cloud --status --project <name>` is read-only: it does **not** mutate `/sync/status` lifecycle fields.
+
+Machine-actionable validation/policy failures from cloud sync routes (`/sync/pull`, `/sync/push`) include:
+
+- `error_class` (`repairable` | `blocked` | `policy`)
+- `error_code` (stable deterministic code)
+- `error` (human-readable message)
 
 ---
 
-## MCP Tools (15 tools)
+## MCP Project Resolution
+
+Engram resolves the project for every MCP tool call from the **server's working directory** (cwd), not from the LLM's arguments. This eliminates project drift caused by agents supplying different names for the same repo.
+
+### Detection algorithm (5 cases)
+
+| Case | Condition | Source | Project |
+|------|-----------|--------|---------|
+| 1 | cwd is a git root with `origin` remote | `git_remote` | repo name from remote URL |
+| 2 | cwd is inside a git repo (subdirectory) | `git_root` | git root's directory basename |
+| 3 | cwd has exactly one git-repo child | `git_child` | child repo name (warning included) |
+| 4 | cwd has multiple git-repo children | `ambiguous_project` error | — write tools fail fast |
+| 5 | no git repo near cwd | `dir_basename` | basename of cwd |
+
+Child scan constraints: depth=1, max 20 entries, 200ms timeout, skips hidden dirs and noise dirs (`node_modules`, `vendor`, `.venv`, `__pycache__`, `target`, `dist`, `build`, `.idea`, `.vscode`).
+
+### Response envelope
+
+Every successful tool response includes these fields:
+
+```json
+{
+  "project": "engram",
+  "project_source": "git_remote",
+  "project_path": "/home/user/engram",
+  "result": "...(tool output)..."
+}
+```
+
+Error responses include `available_projects` when the error is `ambiguous_project` or `unknown_project`.
+
+### Write tools (no project arg)
+
+`mem_save`, `mem_save_prompt`, `mem_session_start`, `mem_session_end`, `mem_session_summary`, `mem_capture_passive`, `mem_update` — project is auto-detected from cwd. Any `project` argument the LLM sends is silently discarded.
+
+### Read tools (optional project override)
+
+`mem_search`, `mem_context`, `mem_timeline`, `mem_get_observation`, `mem_stats` — `project` is an optional argument. If supplied, it is validated against the store via `ProjectExists`. Unknown project names return a structured error with `available_projects`.
+
+### Admin tools (project required)
+
+`mem_delete`, `mem_merge_projects` — `project` remains required. Auto-detection is NOT applied to destructive operations.
+
+### mem_current_project
+
+Use `mem_current_project` as the first call in a session to inspect the detection result:
+
+```json
+{
+  "project": "engram",
+  "project_source": "git_remote",
+  "project_path": "/home/user/engram",
+  "cwd": "/home/user/engram",
+  "available_projects": [],
+  "warning": ""
+}
+```
+
+Returns success even when cwd is ambiguous — empty `project` + non-empty `available_projects` signals the agent to navigate to a specific repo before writing.
+
+---
+
+## MCP Tools (17 tools)
 
 ### mem_search
 
@@ -309,13 +451,13 @@ Get full untruncated content of a specific observation by ID.
 
 ### mem_session_summary
 
-Save comprehensive end-of-session summary using OpenCode-style format:
+Save comprehensive end-of-session summary:
 
 ```
 ## Goal
 ## Instructions
 ## Discoveries
-## Accomplished (✅ done, 🔲 pending)
+## Accomplished
 ## Relevant Files
 ```
 
@@ -335,58 +477,32 @@ Extract structured learnings from text output. Looks for `## Key Learnings:` sec
 
 **Admin tool.** Merge multiple project name variants into a single canonical name. Accepts an array of source project names and a target canonical name. All observations, sessions, and prompts from the source projects are reassigned to the canonical project.
 
----
+### mem_current_project
 
-## Project Name Normalization
+Detect the current project from the working directory. Returns `project`, `project_source`, `project_path`, `cwd`, `available_projects`, and `warning`. Never returns an error — even on ambiguous cwd it returns success with an empty `project` and non-empty `available_projects`. Recommended as the first call when starting a session.
 
-Engram automatically prevents project name drift — the same project saved under different names (`"engram"` vs `"Engram"` vs `"engram-memory"`) by different clients or users.
+### mem_judge
 
-### Automatic normalization
+Record a verdict on a pending memory conflict. When `mem_save` returns `candidates[]` and `judgment_required: true`, the agent inspects the candidates and calls `mem_judge` to mark the relation between the saved memory and a candidate.
 
-All project names are normalized on write and read: **lowercase**, **trimmed**, **collapsed hyphens/underscores**. If a name is changed during normalization, a warning is included in the response.
+Parameters:
+- **judgment_id** (required): the `judgment_id` returned by `mem_save`
+- **relation** (required): `related` | `compatible` | `scoped` | `conflicts_with` | `supersedes` | `not_conflict`
+- **reason** (required): short text explaining the verdict
+- **evidence** (optional): free-form text or JSON the agent can use to justify the call (e.g., quoted excerpts from both memories)
+- **confidence** (optional, default 1.0): 0.0–1.0; if the value is below 0.7 the agent SHOULD ask the user before calling
 
-### Auto-detection
+Re-judging an existing relation overwrites it (deliberate revision). Two agents judging the same pair persist as separate rows — Phase 1 surfaces both; cross-actor reconciliation is Phase 2.
 
-The MCP server auto-detects the project name at startup using a priority chain:
-1. `--project` flag
-2. `ENGRAM_PROJECT` environment variable
-3. Git remote origin URL (extracts repo name)
-4. Git repository root directory name
-5. Current working directory basename
-
-### Similar-project warnings
-
-When saving to a project that doesn't exist yet, Engram checks for similar existing project names (Levenshtein distance, substring, case-insensitive matching) and warns the agent if a likely variant already exists.
-
-### Retroactive cleanup
-
-Use `engram projects consolidate` to interactively merge variant project names, or `mem_merge_projects` for agent-driven consolidation.
+Search results subsequently expose annotation lines like `supersedes: #<id>` and `superseded_by: #<id>` so the recalling agent sees relevant verdicts at-a-glance. The structured `supersedes[]`, `superseded_by[]`, and `conflicts[]` fields are also attached per result.
 
 ---
 
-## MCP Configuration
+## Memory Protocol
 
-Add to any agent's config:
+The Memory Protocol teaches agents **when** and **how** to use Engram's MCP tools. Without it, the agent has the tools but no behavioral guidance. Add this to your agent's prompt file (see [Agent Setup](docs/AGENT-SETUP.md) for per-agent locations).
 
-```json
-{
-  "mcp": {
-    "engram": {
-      "type": "stdio",
-      "command": "engram",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
----
-
-## Memory Protocol Full Text
-
-The Memory Protocol teaches agents **when** and **how** to use Engram's MCP tools. Without it, the agent has the tools but no behavioral guidance. Add this to your agent's prompt file (see README for per-agent locations).
-
-### WHEN TO SAVE (mandatory — not optional)
+### WHEN TO SAVE (mandatory)
 
 Call `mem_save` IMMEDIATELY after any of these:
 - Bug fix completed
@@ -418,7 +534,7 @@ Format for `mem_save`:
 
 ### WHEN TO SEARCH MEMORY
 
-When the user asks to recall something — any variation of "remember", "recall", "what did we do", "how did we solve", "recordar", "acordate", "qué hicimos", or references to past work:
+When the user asks to recall something — any variation of "remember", "recall", "what did we do", "how did we solve", "recordar", "acordate", or references to past work:
 1. First call `mem_context` — checks recent session history (fast, cheap)
 2. If not found, call `mem_search` with relevant keywords (FTS5 full-text search)
 3. If you find a match, use `mem_get_observation` for full untruncated content
@@ -453,9 +569,9 @@ Before ending a session or saying "done" / "listo" / "that's it", you MUST call 
 
 This is NOT optional. If you skip this, the next session starts blind.
 
-### PASSIVE CAPTURE — automatic learning extraction
+### PASSIVE CAPTURE
 
-When completing a task or subtask, include a `## Key Learnings:` section at the end of your response with numbered items. Engram will automatically extract and save these as observations.
+When completing a task, include a `## Key Learnings:` section at the end of your response with numbered items. Engram will automatically extract and save these as observations.
 
 Example:
 ```
@@ -465,28 +581,55 @@ Example:
 2. JWT refresh tokens need atomic rotation to prevent race conditions
 ```
 
-You can also call `mem_capture_passive(content)` directly with any text that contains a learning section. This is a safety net — it captures knowledge even if you forget to call `mem_save` explicitly.
+You can also call `mem_capture_passive(content)` directly with any text that contains a learning section.
 
 ### AFTER COMPACTION
 
-If you see a message about compaction or context reset, or if you see "FIRST ACTION REQUIRED" in your context:
-1. IMMEDIATELY call `mem_session_summary` with the compacted summary content — this persists what was done before compaction
-2. Then call `mem_context` to recover any additional context from previous sessions
+If you see a message about compaction or context reset:
+1. IMMEDIATELY call `mem_session_summary` with the compacted summary content
+2. Then call `mem_context` to recover additional context from previous sessions
 3. Only THEN continue working
 
 Do not skip step 1. Without it, everything done before compaction is lost from memory.
 
 ---
 
+## Project Name Normalization
+
+Engram automatically prevents project name drift — the same project saved under different names (`"engram"` vs `"Engram"` vs `"engram-memory"`) by different clients or users.
+
+### Automatic normalization
+
+All project names are normalized on write and read: **lowercase**, **trimmed**, **collapsed hyphens/underscores**. If a name is changed during normalization, a warning is included in the response.
+
+### Auto-detection
+
+The MCP server auto-detects the project name at startup using a priority chain:
+1. `--project` flag
+2. `ENGRAM_PROJECT` environment variable
+3. Git remote origin URL (extracts repo name)
+4. Git repository root directory name
+5. Current working directory basename
+
+### Similar-project warnings
+
+When saving to a project that doesn't exist yet, Engram checks for similar existing project names (Levenshtein distance, substring, case-insensitive matching) and warns the agent if a likely variant already exists.
+
+### Retroactive cleanup
+
+Use `engram projects consolidate` to interactively merge variant project names, or `mem_merge_projects` for agent-driven consolidation.
+
+---
+
 ## Features
 
-### 1. Full-Text Search (FTS5)
+### Full-Text Search (FTS5)
 
 - Searches across title, content, tool_name, type, and project
 - Query sanitization: wraps each word in quotes to avoid FTS5 syntax errors
 - Supports type and project filters
 
-### 2. Timeline (Progressive Disclosure)
+### Timeline (Progressive Disclosure)
 
 Three-layer pattern for token-efficient memory retrieval:
 
@@ -494,7 +637,7 @@ Three-layer pattern for token-efficient memory retrieval:
 2. `mem_timeline` — Drill into chronological neighborhood of a result
 3. `mem_get_observation` — Get full untruncated content
 
-### 3. Privacy Tags
+### Privacy Tags
 
 `<private>...</private>` content is stripped at TWO levels:
 
@@ -503,36 +646,36 @@ Three-layer pattern for token-efficient memory retrieval:
 
 Example: `Set up API with <private>sk-abc123</private>` becomes `Set up API with [REDACTED]`
 
-### 4. User Prompt Storage
+### User Prompt Storage
 
 Separate table captures what the USER asked (not just tool calls). Gives future sessions the "why" behind the "what". Full FTS5 search support.
 
-### 5. Export / Import
+### Export / Import
 
 Share memories across machines, backup, or migrate:
 
 - `engram export` — JSON dump of all sessions, observations, prompts
 - `engram import <file>` — Load from JSON, sessions use INSERT OR IGNORE (skip duplicates), atomic transaction
 
-### 6. Git Sync (Chunked)
+### Git Sync (Chunked)
 
 Share memories through git repositories using compressed chunks with a manifest index.
 
 - `engram sync` — Exports new memories as a gzipped JSONL chunk to `.engram/chunks/`
-- `engram sync --all` — Exports ALL memories from every project (ignores directory-based filter)
+- `engram sync --all` — Exports ALL memories from every project
 - `engram sync --import` — Imports chunks listed in the manifest that haven't been imported yet
-- `engram sync --status` — Shows how many chunks exist locally vs remotely, and how many are pending import
+- `engram sync --status` — Shows how many chunks exist locally vs remotely (filesystem mode)
+- `engram sync --cloud --status --project <name>` — Shows local, remote, and pending chunk counts for the specified cloud project
 - `engram sync --project NAME` — Filters export to a specific project
 
-**Architecture**:
 ```
 .engram/
-├── manifest.json          ← index of all chunks (small, git-mergeable)
+├── manifest.json          <- index of all chunks (small, git-mergeable)
 ├── chunks/
-│   ├── a3f8c1d2.jsonl.gz ← chunk 1 (gzipped JSONL)
-│   ├── b7d2e4f1.jsonl.gz ← chunk 2
+│   ├── a3f8c1d2.jsonl.gz <- chunk 1 (gzipped JSONL)
+│   ├── b7d2e4f1.jsonl.gz <- chunk 2
 │   └── ...
-└── engram.db              ← local working DB (gitignored)
+└── engram.db              <- local working DB (gitignored)
 ```
 
 **Why chunks?**
@@ -542,125 +685,83 @@ Share memories through git repositories using compressed chunks with a manifest 
 - The manifest is the only file git diffs — it's small and append-only
 - Compressed: a chunk with 8 sessions + 10 observations = ~2KB
 
-**Auto-import**: The OpenCode plugin detects `.engram/manifest.json` at startup and runs `engram sync --import` to load any new chunks. Clone a repo → open OpenCode → team memories are loaded.
-
-**Tracking**: The local DB stores a `sync_chunks` table with chunk IDs that have been imported. This prevents re-importing the same data if `sync --import` runs multiple times.
-
-### 7. AI Compression (Agent-Driven)
+### Agent-Driven Compression
 
 Instead of a separate LLM service, the agent itself compresses observations. The agent already has the model, context, and API key.
 
 **Two levels:**
 
-- **Per-action** (`mem_save`): Structured summaries after each significant action
+- **Per-action** (`mem_save`): Structured summaries (What/Why/Where/Learned)
+- **Session summary** (`mem_session_summary`): Comprehensive end-of-session summary (Goal/Instructions/Discoveries/Accomplished/Files)
 
-  ```
-  **What**: [what was done]
-  **Why**: [reasoning]
-  **Where**: [files affected]
-  **Learned**: [gotchas, decisions]
-  ```
+### No Raw Auto-Capture
 
-- **Session summary** (`mem_session_summary`): OpenCode-style comprehensive summary
-
-  ```
-  ## Goal
-  ## Instructions
-  ## Discoveries
-  ## Accomplished
-  ## Relevant Files
-  ```
-
-The OpenCode plugin injects the **Memory Protocol** via system prompt to teach agents both formats, plus strict rules about when to save and a mandatory session close protocol.
-
-### 8. No Raw Auto-Capture (Agent-Only Memory)
-
-The OpenCode plugin does NOT auto-capture raw tool calls. All memory comes from the agent itself:
-
-- **`mem_save`** — Agent saves structured observations after significant work (decisions, bugfixes, patterns)
-- **`mem_session_summary`** — Agent saves comprehensive end-of-session summaries
-
-**Why?** Raw tool calls (`edit: {file: "foo.go"}`, `bash: {command: "go build"}`) are noisy and pollute FTS5 search results. The agent's curated summaries are higher signal, more searchable, and don't bloat the database. Shell history and git provide the raw audit trail.
-
-The plugin still counts tool calls per session (for session end summary stats) but doesn't persist them as observations.
+All memory comes from the agent itself — no firehose of raw tool calls. Why? Raw tool calls (`edit: {file: "foo.go"}`, `bash: {command: "go build"}`) are noisy and pollute FTS5 search. The agent's curated summaries are higher signal, more searchable, and don't bloat the database. Shell history and git provide the raw audit trail.
 
 ---
 
-## OpenCode Plugin
+## Terminal UI (TUI)
 
-Install with `engram setup opencode` — this copies the plugin to `~/.config/opencode/plugins/engram.ts` AND auto-registers the MCP server in `opencode.json`.
+Interactive Bubbletea-based terminal UI. Launch with `engram tui`.
 
-A thin TypeScript adapter that:
+### Screens
 
-1. **Auto-starts** the engram binary if not running
-2. **Auto-imports** git-synced memories from `.engram/memories.json` if present in the project
-3. **Captures events**: `session.created`, `session.idle`, `session.deleted`, `message.updated`
-4. **Tracks tool count**: Counts tool calls per session (for session end stats), but does NOT persist raw tool observations
-5. **Captures user prompts**: From `message.updated` events (>10 chars)
-6. **Injects Memory Protocol**: Strict rules for when to save, when to search, and mandatory session close protocol — via `chat.system.transform`
-7. **Injects context on compaction**: Auto-saves checkpoint + injects previous session context + reminds compressor
-8. **Privacy**: Strips `<private>` tags before sending to HTTP API
+| Screen | Description |
+|---|---|
+| **Dashboard** | Stats overview (sessions, observations, prompts, projects) + menu |
+| **Search** | FTS5 text search with text input |
+| **Search Results** | Browsable results list from search |
+| **Recent Observations** | Browse all observations, newest first |
+| **Observation Detail** | Full content of a single observation, scrollable |
+| **Timeline** | Chronological context around an observation (before/after) |
+| **Sessions** | Browse all sessions |
+| **Session Detail** | Observations within a specific session |
 
-### Session Resilience
+### Navigation
 
-The plugin uses `ensureSession()` — an idempotent function that creates the session in engram if it doesn't exist yet. This is called from every hook that receives a `sessionID`, not just `session.created`. This means:
+- `j/k` or arrow keys — Navigate lists
+- `Enter` — Select / drill into detail
+- `t` — View timeline for selected observation
+- `s` or `/` — Quick search from any screen
+- `Esc` or `q` — Go back / quit
+- `Ctrl+C` — Force quit
 
-- **Plugin reload**: If OpenCode restarts or the plugin is reloaded mid-session, the session is re-created on the next tool call or compaction event
-- **Reconnect**: If you reconnect to an existing session, the session is created on-demand
-- **No lost data**: Prompts, tool counts, and compaction context all work even if `session.created` was missed
+### Visual Features
 
-Session IDs come from OpenCode's hook inputs (`input.sessionID` in `tool.execute.after`, `input.sessionID` in `experimental.session.compacting`) rather than from a fragile in-memory Map populated by events.
-
-### Plugin API Types (OpenCode `@opencode-ai/plugin`)
-
-The `tool.execute.after` hook receives:
-- **`input`**: `{ tool, sessionID, callID, args }` — `input.sessionID` identifies the OpenCode session
-- **`output`**: `{ title, output, metadata }` — `output.output` has the result string
-
-### ENGRAM_TOOLS (excluded from tool count)
-
-`mem_search`, `mem_save`, `mem_update`, `mem_delete`, `mem_suggest_topic_key`, `mem_save_prompt`, `mem_session_summary`, `mem_context`, `mem_stats`, `mem_timeline`, `mem_get_observation`, `mem_session_start`, `mem_session_end`, `mem_capture_passive`, `mem_merge_projects`
+- **Catppuccin Mocha** color palette
+- **`(active)` badge** — shown next to sessions and observations from active sessions, sorted to top
+- **Scroll indicators** — position in long lists (e.g. "showing 1-20 of 50")
+- **2-line items** — each observation shows title + content preview
 
 ---
 
-## Dependencies
+## Running as a Service
 
-### Go
+### Using systemd
 
-- `github.com/mark3labs/mcp-go v0.44.0` — MCP protocol implementation
-- `modernc.org/sqlite v1.45.0` — Pure Go SQLite driver (no CGO)
-- `github.com/charmbracelet/bubbletea v1.3.10` — Terminal UI framework
-- `github.com/charmbracelet/lipgloss v1.1.0` — Terminal styling
-- `github.com/charmbracelet/bubbles v1.0.0` — TUI components (textinput, etc.)
-- `github.com/lib/pq` — Postgres driver (for cloud server)
-- `github.com/golang-jwt/jwt/v5` — JWT token generation and validation (for cloud auth)
-- `golang.org/x/crypto` — bcrypt password hashing (for cloud auth)
+1. Move binary to `~/.local/bin` (ensure it's in your `$PATH`)
+2. Create directories: `mkdir -p ~/.engram ~/.config/systemd/user`
+3. Create `~/.config/systemd/user/engram.service` (see below)
+4. `systemctl --user daemon-reload`
+5. `systemctl --user enable engram`
+6. `systemctl --user start engram`
+7. `journalctl --user -u engram -f`
 
-### OpenCode Plugin
+```ini
+[Unit]
+Description=Engram Memory Server
+After=network.target
 
-- `@opencode-ai/plugin` — OpenCode plugin types and helpers
-- Runtime: Bun (built into OpenCode)
+[Service]
+WorkingDirectory=%h
+ExecStart=%h/.local/bin/engram serve
+Restart=always
+RestartSec=3
+Environment=ENGRAM_DATA_DIR=%h/.engram
 
----
-
-## Installation
-
-### From source
-
-```bash
-git clone https://github.com/alanbuscaglia/engram.git
-cd engram
-go build -o engram ./cmd/engram
-go install ./cmd/engram
+[Install]
+WantedBy=default.target
 ```
-
-### Binary location
-
-After `go install`: `$GOPATH/bin/engram` (typically `~/go/bin/engram`)
-
-### Data location
-
-`~/.engram/engram.db` (SQLite database, created on first run)
 
 ---
 
@@ -672,19 +773,180 @@ After `go install`: `$GOPATH/bin/engram` (typically `~/go/bin/engram`)
 4. **Agent-driven compression** — The agent already has an LLM. No separate compression service.
 5. **Privacy at two layers** — Strip in plugin AND store. Defense in depth.
 6. **Pure Go SQLite (modernc.org/sqlite)** — No CGO means true cross-platform binary distribution.
-7. **No raw auto-capture** — Raw tool calls (edit, bash, etc.) are noisy, pollute search results, and bloat the database. The agent saves curated summaries via `mem_save` and `mem_session_summary` instead. Shell history and git provide the raw audit trail.
-8. **TUI with Bubbletea** — Interactive terminal UI for browsing memories without leaving the terminal. Follows Gentleman Bubbletea patterns (screen constants, single Model struct, vim keys).
+7. **No raw auto-capture** — The agent saves curated summaries. Shell history and git provide the raw audit trail.
+8. **TUI with Bubbletea** — Interactive terminal UI following Gentleman Bubbletea patterns.
 
 ---
 
-## Inspired By
+## Dependencies
 
-[claude-mem](https://github.com/thedotmack/claude-mem) — But agent-agnostic and with a Go core instead of TypeScript.
+### Go
 
-Key differences from claude-mem:
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `github.com/mark3labs/mcp-go` | v0.44.0 | MCP protocol implementation |
+| `modernc.org/sqlite` | v1.45.0 | Pure Go SQLite driver (no CGO) |
+| `github.com/charmbracelet/bubbletea` | v1.3.10 | Terminal UI framework |
+| `github.com/charmbracelet/lipgloss` | v1.1.0 | Terminal styling |
+| `github.com/charmbracelet/bubbles` | v1.0.0 | TUI components |
 
-- Agent-agnostic (not locked to Claude Code)
-- Go binary (not Node.js/TypeScript)
-- FTS5 instead of ChromaDB
-- Agent-driven compression instead of separate LLM calls
-- Simpler architecture (single binary, embedded web dashboard)
+### OpenCode Plugin
+
+- `@opencode-ai/plugin` — OpenCode plugin types and helpers
+- Runtime: Bun (built into OpenCode)
+
+---
+
+## Dashboard templ regeneration
+
+The cloud dashboard uses [templ](https://templ.guide/) for server-side HTML components. Generated `*_templ.go` files are committed alongside their `.templ` sources. If you modify any `.templ` file in `internal/cloud/dashboard/`, you must regenerate the Go output before committing.
+
+### Prerequisite
+
+Download the pinned templ binary:
+
+```sh
+go mod download
+```
+
+### Regenerate
+
+```sh
+make templ
+# or directly:
+go tool templ generate ./internal/cloud/dashboard/...
+```
+
+The regenerated `components_templ.go`, `layout_templ.go`, and `login_templ.go` must be committed together with the `.templ` source changes. The test `TestTemplGeneratedFilesAreCheckedIn` in `internal/cloud/dashboard/templ_policy_test.go` will fail in CI if generated files are missing or outdated.
+
+**Important**: Always use the pinned version `github.com/a-h/templ v0.3.1001` (already in `go.mod`). Regenerating with a different version produces diff churn in generated output.
+
+---
+
+## Cloud Autosync
+
+Autosync is a background push/pull replication service that keeps your local Engram store in sync with the Engram Cloud server without blocking local writes.
+
+### Enabling Autosync
+
+Autosync is **opt-in**. Set all three environment variables before starting `engram serve` or `engram mcp`:
+
+| Variable | Required | Description |
+|---|---|---|
+| `ENGRAM_CLOUD_AUTOSYNC` | Yes (exact `"1"`) | Enables autosync. Any other value disables it. |
+| `ENGRAM_CLOUD_TOKEN` | Yes | Bearer token for the cloud server. |
+| `ENGRAM_CLOUD_SERVER` | Yes | Base URL of the cloud server (e.g. `https://cloud.engram.example.com`). |
+
+Example:
+
+```sh
+ENGRAM_CLOUD_AUTOSYNC=1 \
+ENGRAM_CLOUD_TOKEN=your-token \
+ENGRAM_CLOUD_SERVER=https://cloud.engram.example.com \
+engram serve
+```
+
+Missing `ENGRAM_CLOUD_TOKEN` or `ENGRAM_CLOUD_SERVER` logs an `ERROR` and disables autosync gracefully — the server still starts.
+
+### Autosync Phase Table
+
+| Phase | Meaning | Dashboard Status |
+|---|---|---|
+| `idle` | Loop running, no cycle yet | running |
+| `pushing` | Pushing local mutations to cloud | running |
+| `pulling` | Pulling remote mutations | running |
+| `healthy` | Last cycle succeeded | healthy |
+| `push_failed` | Last push failed | degraded |
+| `pull_failed` | Last pull failed | degraded |
+| `backoff` | Too many consecutive failures; waiting | degraded |
+| `disabled` | Paused by `StopForUpgrade` | degraded (upgrade_paused) |
+
+### Reason Code Table
+
+`reason_code` appears in `Manager.Status().ReasonCode` and is surfaced via `/sync/status`:
+
+| `reason_code` | Cause | Resolution |
+|---|---|---|
+| `transport_failed` | Network error, server 5xx, or 404 on mutation endpoints | Check server health and network; if 404, see `server_unsupported` note below |
+| `auth_required` | Bearer token rejected (401) | Rotate `ENGRAM_CLOUD_TOKEN` |
+| `policy_forbidden` | Project access denied (403) | Check `ENGRAM_CLOUD_ALLOWED_PROJECTS` on the server |
+| `internal_error` | Panic inside the sync cycle | Check logs for stack trace |
+| `upgrade_paused` | Autosync paused during cloud upgrade (`PhaseDisabled`) | Call `ResumeAfterUpgrade` or restart |
+
+Note: when the cloud server returns 404 on mutation endpoints, the transport logs `[autosync] cloud mutation endpoint returned 404 (server_unsupported)` and the transport-level `ErrorCode` is `"server_unsupported"`, but the manager surfaces this as `reason_code: transport_failed`.
+
+### Troubleshooting
+
+**`transport_failed` with `server_unsupported` in logs**: The cloud server does not yet implement `POST /sync/mutations/push` or `GET /sync/mutations/pull`. Deploy a server version that includes these endpoints before enabling `ENGRAM_CLOUD_AUTOSYNC=1`. Check logs for the line containing `server_unsupported`.
+
+**Autosync not starting**: Check that `ENGRAM_CLOUD_AUTOSYNC` is exactly `"1"` (not `"true"` or `"yes"`), and that both `ENGRAM_CLOUD_TOKEN` and `ENGRAM_CLOUD_SERVER` are non-empty. The process logs an `[autosync] ERROR` line explaining which variable is missing.
+
+**Local writes still blocked**: Autosync runs in its own goroutine and never holds locks shared with the local write path. If local writes appear blocked, investigate the SQLite store layer, not the autosync manager.
+
+---
+
+---
+
+## Cloud Sync Audit Log
+
+When project sync is paused and a push is rejected, Engram records an audit entry in `cloud_sync_audit_log`. This gives operators a persistent trail of every rejection event, visible in the admin dashboard under **Admin > Audit Log**.
+
+### Schema
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | SERIAL PK | Auto-incrementing row identifier |
+| `occurred_at` | TIMESTAMPTZ DEFAULT NOW() | Timestamp of the rejection event |
+| `contributor` | TEXT NOT NULL | Identity of the caller (from `created_by` field in request, or `"unknown"`) |
+| `project` | TEXT NOT NULL | Project name that was paused and rejected |
+| `action` | TEXT NOT NULL | Push type discriminator: `mutation_push` or `chunk_push` |
+| `outcome` | TEXT NOT NULL | Rejection outcome: always `rejected_project_paused` in v1 |
+| `entry_count` | INT DEFAULT 0 | Number of entries in the rejected batch |
+| `reason_code` | TEXT | Short machine-readable reason code (e.g. `sync-paused`) |
+| `metadata` | JSONB | Reserved for future structured context; not populated in v1 |
+
+### Outcome Vocabulary
+
+| Outcome | Meaning |
+|---------|---------|
+| `rejected_project_paused` | Push was rejected because the project's sync is paused via the admin sync control |
+
+### Action Discriminator
+
+| Action | Meaning |
+|--------|---------|
+| `mutation_push` | Rejection occurred on `POST /sync/mutations/push` |
+| `chunk_push` | Rejection occurred on `POST /sync/push` (legacy chunk push) |
+
+Pull requests (`GET /sync/mutations/pull`) are never gated on pause status and never emit audit entries. Paused projects continue to serve reads to enrolled contributors without restriction.
+
+### Retention and Pruning
+
+There is no automatic retention policy in v1. Audit rows accumulate indefinitely. To prune entries older than 90 days, connect to Postgres and run:
+
+```sql
+DELETE FROM cloud_sync_audit_log
+WHERE occurred_at < NOW() - INTERVAL '90 days';
+```
+
+Wrap in a transaction and add a `LIMIT` clause if the table is large:
+
+```sql
+BEGIN;
+DELETE FROM cloud_sync_audit_log
+WHERE id IN (
+  SELECT id FROM cloud_sync_audit_log
+  WHERE occurred_at < NOW() - INTERVAL '90 days'
+  LIMIT 10000
+);
+COMMIT;
+```
+
+---
+
+## Next Steps
+
+- [Agent Setup](docs/AGENT-SETUP.md) — connect your agent to Engram
+- [Plugins](docs/PLUGINS.md) — what the OpenCode and Claude Code plugins add beyond bare MCP
+- [Obsidian Brain](docs/beta/obsidian-brain.md) — visualize memories as a knowledge graph (beta)
+- [Contributing](CONTRIBUTING.md) — how to contribute

@@ -4,6 +4,13 @@
 
 Engram works with **any MCP-compatible agent**. Pick your agent below.
 
+> Cloud bootstrap automation in agent scripts/plugins is intentionally deferred in this rollout. Use `engram cloud ...` manually for now.
+>
+> Deferred validation scope for this rollout:
+> - Setup/plugin scripts are **not** yet validated as cloud enrollment/login orchestrators.
+> - `engram setup ...` installs MCP/plugin integrations only; it does **not** auto-run `engram cloud config/enroll/upgrade`.
+> - Cloud onboarding contract remains CLI-first until script-level cloud flows are explicitly implemented.
+
 ## Quick Reference
 
 | Agent | One-liner | Manual Config |
@@ -18,6 +25,14 @@ Engram works with **any MCP-compatible agent**. Pick your agent below.
 | Windsurf | Manual JSON config | [Details](#windsurf) |
 | Any MCP agent | `engram mcp` (stdio) | [Details](#any-other-mcp-agent) |
 
+### Project auto-detection (important)
+
+**Do not pass `project` to write tools.** Engram auto-detects the project from the server's working directory (cwd) using git remote URL, repo root name, or directory basename. Agents that include `project` in `mem_save` or similar calls will have that argument silently discarded.
+
+**Recommended first call:** `mem_current_project` — confirms which project Engram detected before you start writing. Returns `project_source` (how it was detected) and `available_projects` (if cwd is ambiguous).
+
+**Read tools** (`mem_search`, `mem_context`, `mem_get_observation`, `mem_stats`, `mem_timeline`) accept an optional `project` override validated against the store. Omit it to auto-detect.
+
 ---
 
 ## OpenCode
@@ -30,21 +45,22 @@ Engram works with **any MCP-compatible agent**. Pick your agent below.
 engram setup opencode
 ```
 
-This does two things:
+This does three things:
 1. Copies the plugin to `~/.config/opencode/plugins/engram.ts` (session tracking, Memory Protocol, compaction recovery)
-2. Adds the `engram` MCP server entry to your `opencode.json` (the 13 memory tools)
+2. Adds the `engram` MCP server entry to your `opencode.json` with `--tools=agent` (12 agent-facing tools)
+3. Adds `opencode-subagent-statusline` to your `tui.json` or `tui.jsonc` so OpenCode shows sub-agent activity in the sidebar/home footer
 
-The plugin also needs the HTTP server running for session tracking:
+The plugin auto-starts the HTTP server if needed for session tracking. If your environment blocks background processes, run it manually:
 
 ```bash
 engram serve &
 ```
 
-> **Windows**: On Windows, `engram setup opencode` writes to `%APPDATA%\opencode\plugins\` and `%APPDATA%\opencode\opencode.json` automatically. To run the server in the background: `Start-Process engram -ArgumentList "serve" -WindowStyle Hidden` (PowerShell) or just run `engram serve` in a separate terminal.
+> **Windows**: OpenCode uses `~/.config/opencode/` on Windows too (it does not read `%APPDATA%\opencode\`). `engram setup opencode` writes to `~/.config/opencode/plugins/` and `~/.config/opencode/opencode.json`. To run the server in the background: `Start-Process engram -ArgumentList "serve" -WindowStyle Hidden` (PowerShell) or just run `engram serve` in a separate terminal.
 
-**Alternative: Manual MCP-only setup** (no plugin, just the 13 memory tools):
+**Alternative: Manual MCP-only setup** (no plugin, all 17 tools by default):
 
-Add to your `opencode.json` (global: `~/.config/opencode/opencode.json` or project-level; on Windows: `%APPDATA%\opencode\opencode.json`):
+Add to your `opencode.json` (global: `~/.config/opencode/opencode.json` on all platforms, or project-level):
 
 ```json
 {
@@ -81,9 +97,9 @@ That's it. The plugin registers the MCP server, hooks, and Memory Protocol skill
 engram setup claude-code
 ```
 
-During setup, you'll be asked whether to add engram tools to `~/.claude/settings.json` permissions allowlist — this prevents Claude Code from prompting for confirmation on every memory operation.
+During setup, you'll be asked whether to add engram's agent-profile MCP tools to `~/.claude/settings.json` `permissions.allow`. The setup writes entries for both the durable user-level MCP server id (`mcp__engram__...`) and the plugin-scoped server id used by older Claude Code plugin installs, so re-running setup repairs stale or incomplete allowlists without adding startup delay.
 
-**Option C: Bare MCP** — just the 13 memory tools, no session management:
+**Option C: Bare MCP** — all 17 tools by default, no session management:
 
 Add to your `.claude/settings.json` (project) or `~/.claude/settings.json` (global):
 
@@ -370,3 +386,108 @@ Save proactively after significant work. After context resets, call mem_context 
 ```
 
 This is the **nuclear option** — system prompts survive everything, including compaction.
+
+---
+
+## Conflict Surfacing (automatic)
+
+When you save a memory with `mem_save`, Engram automatically scans for similar existing observations using FTS5 full-text search. If any candidates are found above a relevance threshold, the response includes a `candidates[]` array and `judgment_required: true`. Nothing to configure — this runs on every save.
+
+### What the agent sees
+
+`mem_save` returns an enriched envelope when candidates exist:
+
+```json
+{
+  "result": "Memory saved: \"...\"\nCONFLICT REVIEW PENDING — 2 candidate(s); use mem_judge to record verdicts.",
+  "id": 42,
+  "sync_id": "obs_abc123",
+  "judgment_required": true,
+  "judgment_status": "pending",
+  "judgment_id": "rel-<hex>",
+  "candidates": [
+    {
+      "id": 18,
+      "sync_id": "obs_xyz789",
+      "title": "We use sessions for auth",
+      "type": "decision",
+      "score": -3.14,
+      "judgment_id": "rel-<hex-for-this-pair>"
+    }
+  ]
+}
+```
+
+When no candidates are found, `judgment_required` is `false` and no `candidates` field is present. The `result` string is unchanged.
+
+### How the agent resolves conflicts
+
+The agent iterates `candidates[]` and calls `mem_judge` once per entry, using that entry's own `judgment_id`. The agent does NOT use the top-level `judgment_id` for multiple candidates — each candidate has its own.
+
+The agent's built-in heuristic (from `serverInstructions`) decides when to ask the user versus resolve autonomously:
+
+- **Ask the user** when confidence is below 0.7, OR when the chosen relation is `supersedes` or `conflicts_with` AND the observation type is `architecture`, `policy`, or `decision`.
+- **Resolve silently** when confidence >= 0.7 AND the relation is `related`, `compatible`, `scoped`, or `not_conflict`.
+
+When asking, the agent raises it naturally in the conversation — not as a blocking CLI prompt or dashboard action.
+
+### How the user sees this
+
+The user sees it in the normal conversation flow. Example:
+
+> "I noticed memory #18 ('We use sessions for auth') might conflict with what we just saved. Want me to mark the new one as superseding it, or are they about different scopes? I can also mark them as compatible if both still apply."
+
+There is no separate dashboard or conflict list in Phase 1.
+
+### What happens after judgment
+
+Once the agent calls `mem_judge` with a verdict:
+- The relation row is persisted with `judgment_status: "judged"` and the chosen `relation`.
+- If the relation is `supersedes`, future `mem_search` results will show `supersedes:` / `superseded_by:` annotations for the affected observations.
+- If the relation is `conflicts_with`, `compatible`, `related`, `scoped`, or `not_conflict`, the judgment is stored in `memory_relations` but no annotation appears in search results (Phase 1 scope).
+
+Nothing breaks if `mem_judge` is never called — pending relations accumulate unjudged but do not affect other operations.
+
+---
+
+## Cloud Autosync toggle
+
+`engram serve` and `engram mcp` support continuous background replication to an Engram Cloud server. This is **opt-in** and never fatal on missing config.
+
+### Prerequisites
+
+1. A running Engram Cloud server (see `docker-compose.cloud.yml` or `engram cloud serve`). The server must be a build that includes the mutation endpoints (`POST /sync/mutations/push`, `GET /sync/mutations/pull`). If the server is older, autosync enters `PhaseBackoff` with `reason_code: transport_failed` and logs `server_unsupported` to stderr.
+
+2. A valid bearer token configured on the server.
+
+### Enable autosync
+
+```sh
+export ENGRAM_CLOUD_AUTOSYNC=1          # exact "1" only
+export ENGRAM_CLOUD_TOKEN=your-token    # bearer token
+export ENGRAM_CLOUD_SERVER=https://cloud.engram.example.com
+
+engram serve
+# or
+engram mcp
+```
+
+The process logs `[autosync] started (server=...)` on success. Missing token or server URL logs `[autosync] ERROR: ...` and the process starts normally without autosync.
+
+---
+
+## Cloud dashboard (templ contributors)
+
+If you are contributing to the cloud dashboard (`internal/cloud/dashboard/`), the HTML components are rendered via [templ](https://templ.guide/). Before committing changes to any `.templ` file, regenerate the Go output:
+
+```sh
+# Download pinned version (first time only)
+go mod download
+
+# Regenerate
+make templ
+# or directly:
+go tool templ generate ./internal/cloud/dashboard/...
+```
+
+Commit the regenerated `components_templ.go`, `layout_templ.go`, and `login_templ.go` alongside your `.templ` source changes. CI will fail if they are missing or outdated (`TestTemplGeneratedFilesAreCheckedIn`).

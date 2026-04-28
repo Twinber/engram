@@ -6,12 +6,14 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/store"
@@ -24,16 +26,22 @@ var loadServerStats = func(s *store.Store) (*store.Stats, error) {
 // SyncStatusProvider returns the current sync status. This is implemented
 // by autosync.Manager and injected from cmd/engram/main.go.
 type SyncStatusProvider interface {
-	Status() SyncStatus
+	Status(project string) SyncStatus
 }
 
 // SyncStatus mirrors autosync.Status to avoid a direct import cycle.
 type SyncStatus struct {
-	Phase               string     `json:"phase"`
-	LastError           string     `json:"last_error,omitempty"`
-	ConsecutiveFailures int        `json:"consecutive_failures"`
-	BackoffUntil        *time.Time `json:"backoff_until,omitempty"`
-	LastSyncAt          *time.Time `json:"last_sync_at,omitempty"`
+	Enabled              bool       `json:"enabled"`
+	Phase                string     `json:"phase"`
+	LastError            string     `json:"last_error,omitempty"`
+	ConsecutiveFailures  int        `json:"consecutive_failures"`
+	BackoffUntil         *time.Time `json:"backoff_until,omitempty"`
+	LastSyncAt           *time.Time `json:"last_sync_at,omitempty"`
+	ReasonCode           string     `json:"reason_code,omitempty"`
+	ReasonMessage        string     `json:"reason_message,omitempty"`
+	UpgradeStage         string     `json:"upgrade_stage,omitempty"`
+	UpgradeReasonCode    string     `json:"upgrade_reason_code,omitempty"`
+	UpgradeReasonMessage string     `json:"upgrade_reason_message,omitempty"`
 }
 
 type Server struct {
@@ -101,6 +109,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /sessions", s.handleCreateSession)
 	s.mux.HandleFunc("POST /sessions/{id}/end", s.handleEndSession)
 	s.mux.HandleFunc("GET /sessions/recent", s.handleRecentSessions)
+	s.mux.HandleFunc("DELETE /sessions/{id}", s.handleDeleteSession)
 
 	// Observations
 	s.mux.HandleFunc("POST /observations", s.handleAddObservation)
@@ -120,6 +129,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /prompts", s.handleAddPrompt)
 	s.mux.HandleFunc("GET /prompts/recent", s.handleRecentPrompts)
 	s.mux.HandleFunc("GET /prompts/search", s.handleSearchPrompts)
+	s.mux.HandleFunc("DELETE /prompts/{id}", s.handleDeletePrompt)
 
 	// Context
 	s.mux.HandleFunc("GET /context", s.handleContext)
@@ -335,7 +345,12 @@ func (s *Server) handleDeleteObservation(w http.ResponseWriter, r *http.Request)
 
 	hard := queryBool(r, "hard", false)
 	if err := s.store.DeleteObservation(id, hard); err != nil {
-		jsonError(w, http.StatusInternalServerError, err.Error())
+		switch {
+		case errors.Is(err, store.ErrObservationNotFound):
+			jsonError(w, http.StatusNotFound, err.Error())
+		default:
+			jsonError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
 
@@ -428,10 +443,71 @@ func (s *Server) handleSearchPrompts(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, prompts)
 }
 
+func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		jsonError(w, http.StatusBadRequest, "session id is required")
+		return
+	}
+
+	if err := s.store.DeleteSession(id); err != nil {
+		switch {
+		case errors.Is(err, store.ErrSessionDeleteBlocked):
+			jsonError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, store.ErrSessionHasObservations):
+			jsonError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, store.ErrSessionNotFound):
+			jsonError(w, http.StatusNotFound, err.Error())
+		default:
+			jsonError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	// local-only delete path: do not notify autosync.
+	jsonResponse(w, http.StatusOK, map[string]string{"id": id, "status": "deleted"})
+}
+
+func (s *Server) handleDeletePrompt(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid prompt id")
+		return
+	}
+
+	if err := s.store.DeletePrompt(id); err != nil {
+		if errors.Is(err, store.ErrPromptNotFound) {
+			jsonError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.notifyWrite()
+	jsonResponse(w, http.StatusOK, map[string]any{"id": id, "status": "deleted"})
+}
+
 // ─── Export / Import ─────────────────────────────────────────────────────────
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
-	data, err := s.store.Export()
+	query := r.URL.Query()
+	project := query.Get("project")
+	if _, provided := query["project"]; provided && strings.TrimSpace(project) == "" {
+		jsonError(w, http.StatusBadRequest, "project parameter must not be blank")
+		return
+	}
+
+	var (
+		data *store.ExportData
+		err  error
+	)
+	if strings.TrimSpace(project) != "" {
+		data, err = s.store.ExportProject(project)
+	} else {
+		data, err = s.store.Export()
+	}
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -504,14 +580,21 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status := s.syncStatus.Status()
+	status := s.syncStatus.Status(r.URL.Query().Get("project"))
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"enabled":              true,
+		"enabled":              status.Enabled,
 		"phase":                status.Phase,
 		"last_error":           status.LastError,
 		"consecutive_failures": status.ConsecutiveFailures,
 		"backoff_until":        status.BackoffUntil,
 		"last_sync_at":         status.LastSyncAt,
+		"reason_code":          status.ReasonCode,
+		"reason_message":       status.ReasonMessage,
+		"upgrade": map[string]any{
+			"stage":          status.UpgradeStage,
+			"reason_code":    status.UpgradeReasonCode,
+			"reason_message": status.UpgradeReasonMessage,
+		},
 	})
 }
 

@@ -2,6 +2,10 @@
 
 # Plugins
 
+> Deferred scope note: plugin-level automatic cloud enrollment/login/upgrade orchestration is not part of this rollout yet. Current cloud flows are CLI-driven (`engram cloud ...`).
+>
+> Validation boundary (current): plugin scripts are validated for memory/session workflows, not as cloud bootstrap orchestrators. Use CLI for cloud config/auth/enrollment/upgrade.
+
 - [OpenCode Plugin](#opencode-plugin)
 - [Claude Code Plugin](#claude-code-plugin)
 - [Privacy](#privacy)
@@ -33,6 +37,7 @@ The plugin:
 - **Injects previous session context** into the compaction prompt
 - **Instructs the compressor** to tell the new agent to persist the compacted summary via `mem_session_summary`
 - **Strips `<private>` tags** before sending data
+- **Enables** `opencode-subagent-statusline` in `tui.json` or `tui.jsonc` during `engram setup opencode`, adding a live sub-agent monitor to OpenCode's sidebar/home footer. To disable it later, remove `"opencode-subagent-statusline"` from the `"plugin"` array in your TUI config and restart OpenCode.
 
 **No raw tool call recording** — the agent handles all memory via `mem_save` and `mem_session_summary`.
 
@@ -77,7 +82,7 @@ claude --plugin-dir ./plugin/claude-code
 
 | Feature | Bare MCP | Plugin |
 |---------|----------|--------|
-| 13 memory tools | ✓ | ✓ |
+| MCP tools available | 17 default (`engram mcp`) | 13 agent-profile tools (`engram mcp --tools=agent`) |
 | Session tracking (auto-start) | ✗ | ✓ |
 | Auto-import git-synced memories | ✗ | ✓ |
 | Compaction recovery | ✗ | ✓ |
@@ -117,6 +122,66 @@ plugin/claude-code/
 - **When to search** memory (reactive + proactive)
 - **Session close protocol** — mandatory `mem_session_summary` before ending
 - **After compaction** — 3-step recovery: persist summary → load context → continue
+
+---
+
+## MCP Tool Reference — mem_judge
+
+`mem_judge` is available in the `agent` profile (`engram mcp --tools=agent`). It is NOT exposed in the `admin` profile.
+
+### Purpose
+
+Records a verdict on a pending memory conflict surfaced by `mem_save`. When `mem_save` returns `judgment_required: true`, the agent iterates `candidates[]` and calls `mem_judge` once per entry.
+
+### Parameters
+
+| Parameter | Required | Type | Description |
+|-----------|----------|------|-------------|
+| `judgment_id` | yes | string | From `candidates[].judgment_id` in the `mem_save` response. Format: `rel-<hex>`. |
+| `relation` | yes | string | One of: `related`, `compatible`, `scoped`, `conflicts_with`, `supersedes`, `not_conflict` |
+| `reason` | no | string | Free-text explanation of the verdict |
+| `evidence` | no | string | Supporting evidence (JSON or free text; e.g., user's exact words) |
+| `confidence` | no | float | 0.0..1.0 — default 1.0; clamped to range |
+| `session_id` | no | string | Session ID for provenance (auto-detected if omitted) |
+
+### Behavior
+
+On success, `mem_judge`:
+- Flips `judgment_status` from `pending` to `judged` on the matching `memory_relations` row
+- Persists `relation`, `reason`, `evidence`, `confidence`, actor provenance (`actor="agent"`, `marked_by_kind="agent"`), and `session_id`
+- Returns the updated relation row as JSON
+
+On error (unknown `judgment_id` or invalid `relation`), returns `IsError: true`. The relation row is NOT mutated on error.
+
+Re-judging an already-judged `judgment_id` overwrites the verdict (deliberate revision is allowed).
+
+### Search annotation behavior (observed)
+
+After a verdict is recorded, `mem_search` annotations surface as follows:
+
+| Relation verdict | Annotation in `mem_search` results |
+|-----------------|-----------------------------------|
+| `supersedes` | `supersedes: #<id>` on the source observation; `superseded_by: #<id>` on the target |
+| `pending` (not yet judged) | `conflict: contested by #<id> (pending)` on both observations |
+| `conflicts_with` | No annotation line. Judgment is stored in `memory_relations` but not surfaced in search results in Phase 1. |
+| `compatible`, `related`, `scoped`, `not_conflict` | No annotation line. Judgment is stored but not surfaced in Phase 1. |
+
+> **Known gap**: `conflicts_with` judgments are persisted and queryable in `memory_relations` but do not produce a visible annotation in `mem_search` output. Only `supersedes` and `pending` relations produce annotation lines. This is by design for Phase 1 — a `conflicts_with` annotation format is not yet defined.
+
+### mem_save envelope fields (conflict surfacing)
+
+When `mem_save` detects candidates, the JSON response includes:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `judgment_required` | bool | `true` when candidates were found; `false` otherwise |
+| `judgment_status` | string | `"pending"` (only present when `judgment_required: true`) |
+| `judgment_id` | string | Convenience: the first candidate's `judgment_id` (use `candidates[].judgment_id` for multi-candidate loops) |
+| `candidates` | array | Each entry has `id`, `sync_id`, `title`, `type`, `score`, `judgment_id`, and optionally `topic_key` |
+| `id` | int | Internal ID of the just-saved observation |
+| `sync_id` | string | Stable sync ID of the just-saved observation |
+
+Old clients that read only the `result` string continue to work — these fields are additive.
 
 ---
 

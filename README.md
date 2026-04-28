@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="1024" height="340" alt="image" src="https://github.com/user-attachments/assets/32ed8985-841d-49c3-81f7-2aabc7c7c564" />
+  <img width="1024" alt="Engram Cloud" src="assets/branding/engram-cloud-logo.png" />
 </p>
 
 <p align="center">
@@ -9,6 +9,7 @@
 
 <p align="center">
   <a href="docs/INSTALLATION.md">Installation</a> &bull;
+  <a href="docs/engram-cloud/README.md">Engram Cloud</a> &bull;
   <a href="docs/AGENT-SETUP.md">Agent Setup</a> &bull;
   <a href="docs/ARCHITECTURE.md">Architecture</a> &bull;
   <a href="docs/PLUGINS.md">Plugins</a> &bull;
@@ -68,27 +69,17 @@ That's it. No Node.js, no Python, no Docker. **One binary, one SQLite file.**
 
 Full details on session lifecycle, topic keys, and memory hygiene → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
-## MCP Tools
+## MCP Tools (17)
 
-| Tool | Purpose |
-|------|---------|
-| `mem_save` | Save observation |
-| `mem_update` | Update by ID |
-| `mem_delete` | Soft or hard delete |
-| `mem_suggest_topic_key` | Stable key for evolving topics |
-| `mem_search` | Full-text search |
-| `mem_session_summary` | End-of-session save |
-| `mem_context` | Recent session context |
-| `mem_timeline` | Chronological drill-in |
-| `mem_get_observation` | Full content by ID |
-| `mem_save_prompt` | Save user prompt |
-| `mem_stats` | Memory statistics |
-| `mem_session_start` | Register session start |
-| `mem_session_end` | Mark session complete |
-| `mem_capture_passive` | Extract learnings from text output |
-| `mem_merge_projects` | Merge project name variants (admin) |
+| Category | Tools |
+|----------|-------|
+| **Save & Update** | `mem_save`, `mem_update`, `mem_delete`, `mem_suggest_topic_key` |
+| **Search & Retrieve** | `mem_search`, `mem_context`, `mem_timeline`, `mem_get_observation` |
+| **Session Lifecycle** | `mem_session_start`, `mem_session_end`, `mem_session_summary` |
+| **Conflict Surfacing** | `mem_judge` |
+| **Utilities** | `mem_save_prompt`, `mem_stats`, `mem_capture_passive`, `mem_merge_projects`, `mem_current_project` |
 
-Full tool reference → [docs/ARCHITECTURE.md#mcp-tools](docs/ARCHITECTURE.md#mcp-tools)
+Full tool reference with parameters → [DOCS.md#mcp-tools-17-tools](DOCS.md#mcp-tools-17-tools)
 
 ## Terminal UI
 
@@ -109,6 +100,8 @@ engram tui
 
 Share memories across machines. Uses compressed chunks — no merge conflicts, no huge files.
 
+Local SQLite remains the source of truth. Cloud integration is opt-in replication.
+
 ```bash
 engram sync                    # Export new memories as compressed chunk
 git add .engram/ && git commit -m "sync engram memories"
@@ -118,13 +111,56 @@ engram sync --status           # Check sync status
 
 Full sync documentation → [DOCS.md](DOCS.md)
 
+## Cloud Integration (Opt-In Replication)
+
+Cloud is optional. Local SQLite stays authoritative; cloud is replication/shared access only.
+
+**Recommended first path (local smoke):**
+
+```bash
+docker compose -f docker-compose.cloud.yml up -d
+engram cloud config --server http://127.0.0.1:18080
+engram cloud enroll smoke-project
+engram sync --cloud --project smoke-project
+```
+
+Cloud mode is always project-scoped (`--project` is required; `engram sync --cloud --all` is intentionally blocked).
+Known repairable cloud sync/upsert/canonicalization failures keep the original error visible and recommend the explicit `doctor`/`repair` flow below; Engram never auto-applies repair from sync or autosync.
+
+**After upgrading `engram` while an MCP client is already running:**
+
+```bash
+engram setup claude-code
+```
+
+Then restart Claude Code so it reloads the Engram MCP subprocess and refreshed hook/config files. Updating the `engram` binary on disk does not replace an already-running stdio MCP process.
+
+**Upgrade flow for existing local databases** (diagnose → repair → bootstrap → status):
+
+```bash
+engram cloud upgrade doctor --project smoke-project        # read-only readiness check
+engram cloud upgrade repair --project smoke-project --dry-run
+engram cloud upgrade repair --project smoke-project --apply
+engram cloud upgrade bootstrap --project smoke-project     # resumable enroll + push + verify
+engram cloud upgrade status --project smoke-project        # stage/class/reason
+```
+
+See [DOCS.md — Cloud upgrade flow](DOCS.md#cloud-upgrade-flow) for the full state machine.
+
+For authenticated mode, upgrade flow, dashboard behavior, reason codes, and full runtime/env details:
+
+- [Engram Cloud docs landing](docs/engram-cloud/README.md)
+- [Engram Cloud quickstart](docs/engram-cloud/quickstart.md)
+- [DOCS.md — Cloud CLI reference](DOCS.md#cloud-cli-opt-in)
+- [DOCS.md — Cloud Autosync](DOCS.md#cloud-autosync)
+
 ## CLI Reference
 
 | Command | Description |
 |---------|-------------|
 | `engram setup [agent]` | Install agent integration |
 | `engram serve [port]` | Start HTTP API (default: 7437) |
-| `engram mcp` | Start MCP server (stdio). Accepts `--project` or `ENGRAM_PROJECT` |
+| `engram mcp [--tools=PROFILE]` | Start MCP server (stdio transport) |
 | `engram tui` | Launch terminal UI |
 | `engram search <query>` | Search memories |
 | `engram save <title> <msg>` | Save a memory |
@@ -133,23 +169,30 @@ Full sync documentation → [DOCS.md](DOCS.md)
 | `engram stats` | Memory statistics |
 | `engram export [file]` | Export to JSON |
 | `engram import <file>` | Import from JSON |
-| `engram sync` | Git sync export |
-| `engram projects list` | Show all projects with observation/session/prompt counts |
-| `engram projects consolidate` | Interactive merge of similar project names (`--all`, `--dry-run`) |
-| `engram projects prune` | Remove projects with 0 observations (`--dry-run`) |
+| `engram sync` | Git sync export/import |
+| `engram cloud <subcommand>` | Opt-in cloud config/status/enrollment + cloud runtime (`serve`) |
+| `engram projects list\|consolidate\|prune` | Manage project names |
+| `engram obsidian-export` | Export to Obsidian vault (beta) |
 | `engram version` | Show version |
+
+Full CLI with all flags → [docs/ARCHITECTURE.md#cli-reference](docs/ARCHITECTURE.md#cli-reference)
 
 ## Documentation
 
 | Doc | Description |
 |-----|-------------|
 | [Installation](docs/INSTALLATION.md) | All install methods + platform support |
+| [Engram Cloud](docs/engram-cloud/README.md) | Cloud landing page, quickstart, branding, and deep links |
 | [Agent Setup](docs/AGENT-SETUP.md) | Per-agent configuration + Memory Protocol |
 | [Architecture](docs/ARCHITECTURE.md) | How it works + MCP tools + project structure |
 | [Plugins](docs/PLUGINS.md) | OpenCode & Claude Code plugin details |
 | [Comparison](docs/COMPARISON.md) | Why Engram vs claude-mem |
+| [Intended Usage](docs/intended-usage.md) | Mental model — how Engram is meant to be used |
+| [Obsidian Brain](docs/beta/obsidian-brain.md) | Export memories as Obsidian knowledge graph (beta) |
 | [Contributing](CONTRIBUTING.md) | Contribution workflow + standards |
 | [Full Docs](DOCS.md) | Complete technical reference |
+
+> **Dashboard contributors**: if you modify `.templ` files in `internal/cloud/dashboard/`, run `make templ` to regenerate before committing. See [DOCS.md — Dashboard templ regeneration](DOCS.md#dashboard-templ-regeneration).
 
 ## License
 
@@ -158,3 +201,9 @@ MIT
 ---
 
 **Inspired by [claude-mem](https://github.com/thedotmack/claude-mem)** — but agent-agnostic, simpler, and built different.
+
+## Contributors
+
+<a href="https://github.com/Gentleman-Programming/engram/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=Gentleman-Programming/engram&max=100" />
+</a>

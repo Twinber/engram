@@ -51,7 +51,7 @@ if [ ! -f "$STATE_FILE" ]; then
 
   # Inject ToolSearch + mem_context instruction.
   # Use --arg so jq handles all escaping; use printf to avoid echo interpreting \n.
-  TOOL_MSG="CRITICAL FIRST ACTION — Execute this ToolSearch NOW before responding to the user:"$'\n'"select:mcp__plugin_engram_engram__mem_save,mcp__plugin_engram_engram__mem_search,mcp__plugin_engram_engram__mem_context,mcp__plugin_engram_engram__mem_session_summary,mcp__plugin_engram_engram__mem_get_observation,mcp__plugin_engram_engram__mem_save_prompt"$'\n\n'"After loading tools, call mem_context to check for prior session history before responding."
+  TOOL_MSG="CRITICAL FIRST ACTION — Execute this ToolSearch NOW before responding to the user:"$'\n'"select:mcp__engram__mem_save,mcp__engram__mem_search,mcp__engram__mem_context,mcp__engram__mem_session_summary,mcp__engram__mem_session_start,mcp__engram__mem_session_end,mcp__engram__mem_get_observation,mcp__engram__mem_suggest_topic_key,mcp__engram__mem_capture_passive,mcp__engram__mem_save_prompt,mcp__engram__mem_update,mcp__engram__mem_current_project,mcp__engram__mem_judge"$'\n\n'"After loading tools, call mem_context to check for prior session history before responding."
   OUTPUT=$(jq -n --arg msg "$TOOL_MSG" '{"systemMessage": $msg}')
 
   printf '%s\n' "$OUTPUT"

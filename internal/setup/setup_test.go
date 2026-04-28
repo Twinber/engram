@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -23,6 +25,7 @@ func resetSetupSeams(t *testing.T) {
 	oldJSONMarshalFn := jsonMarshalFn
 	oldJSONMarshalIndentFn := jsonMarshalIndentFn
 	oldInjectOpenCodeMCPFn := injectOpenCodeMCPFn
+	oldInjectOpenCodeTUIPluginFn := injectOpenCodeTUIPluginFn
 	oldInjectGeminiMCPFn := injectGeminiMCPFn
 	oldWriteGeminiSystemPromptFn := writeGeminiSystemPromptFn
 	oldWriteCodexMemoryInstructionFilesFn := writeCodexMemoryInstructionFilesFn
@@ -45,6 +48,7 @@ func resetSetupSeams(t *testing.T) {
 		jsonMarshalFn = oldJSONMarshalFn
 		jsonMarshalIndentFn = oldJSONMarshalIndentFn
 		injectOpenCodeMCPFn = oldInjectOpenCodeMCPFn
+		injectOpenCodeTUIPluginFn = oldInjectOpenCodeTUIPluginFn
 		injectGeminiMCPFn = oldInjectGeminiMCPFn
 		writeGeminiSystemPromptFn = oldWriteGeminiSystemPromptFn
 		writeCodexMemoryInstructionFilesFn = oldWriteCodexMemoryInstructionFilesFn
@@ -311,8 +315,8 @@ func TestInstallOpenCodeSuccessAndMCPRegistered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("installOpenCode failed: %v", err)
 	}
-	if result.Files != 2 {
-		t.Fatalf("expected 2 files after MCP registration, got %d", result.Files)
+	if result.Files != 3 {
+		t.Fatalf("expected 3 files after MCP + TUI registration, got %d", result.Files)
 	}
 
 	pluginPath := filepath.Join(xdg, "opencode", "plugins", "engram.ts")
@@ -334,6 +338,29 @@ func TestInstallOpenCodeSuccessAndMCPRegistered(t *testing.T) {
 	}
 	if _, ok := mcp["engram"]; !ok {
 		t.Fatalf("expected mcp.engram registration")
+	}
+
+	tuiRaw, err := os.ReadFile(filepath.Join(xdg, "opencode", "tui.json"))
+	if err != nil {
+		t.Fatalf("read opencode tui config: %v", err)
+	}
+	var tuiCfg map[string]any
+	if err := json.Unmarshal(tuiRaw, &tuiCfg); err != nil {
+		t.Fatalf("parse opencode tui config: %v", err)
+	}
+	plugins, ok := tuiCfg["plugin"].([]any)
+	if !ok {
+		t.Fatalf("expected plugin array in tui.json")
+	}
+	var found bool
+	for _, plugin := range plugins {
+		if plugin == openCodeSubagentStatuslinePlugin {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected %q plugin registration", openCodeSubagentStatuslinePlugin)
 	}
 }
 
@@ -380,8 +407,26 @@ func TestInstallOpenCodeMCPInjectionFailureIsNonFatal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected non-fatal MCP injection failure, got %v", err)
 	}
-	if result.Files != 1 {
-		t.Fatalf("expected only plugin file counted when MCP injection fails, got %d", result.Files)
+	if result.Files != 2 {
+		t.Fatalf("expected plugin file + TUI config when MCP injection fails, got %d", result.Files)
+	}
+}
+
+func TestInstallOpenCodeTUIInjectionFailureIsNonFatal(t *testing.T) {
+	resetSetupSeams(t)
+	home := useTestHome(t)
+	runtimeGOOS = "linux"
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	injectOpenCodeTUIPluginFn = func() error {
+		return errors.New("cannot write tui config")
+	}
+
+	result, err := installOpenCode()
+	if err != nil {
+		t.Fatalf("expected non-fatal TUI injection failure, got %v", err)
+	}
+	if result.Files != 2 {
+		t.Fatalf("expected plugin file + MCP config when TUI injection fails, got %d", result.Files)
 	}
 }
 
@@ -430,6 +475,96 @@ func TestInjectOpenCodeMCPPreservesExistingAndIsIdempotent(t *testing.T) {
 	if engram["enabled"] != true {
 		t.Fatalf("expected engram.enabled=true")
 	}
+}
+
+func TestInjectOpenCodeTUIPluginPreservesExistingAndIsIdempotent(t *testing.T) {
+	resetSetupSeams(t)
+	home := useTestHome(t)
+	runtimeGOOS = "linux"
+	xdg := filepath.Join(home, "xdg")
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+
+	configPath := filepath.Join(xdg, "opencode", "tui.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	initial := `{"$schema":"https://opencode.ai/tui.json","plugin":["existing-plugin"]}`
+	if err := os.WriteFile(configPath, []byte(initial), 0644); err != nil {
+		t.Fatalf("write initial config: %v", err)
+	}
+
+	if err := injectOpenCodeTUIPlugin(); err != nil {
+		t.Fatalf("injectOpenCodeTUIPlugin failed: %v", err)
+	}
+	if err := injectOpenCodeTUIPlugin(); err != nil {
+		t.Fatalf("injectOpenCodeTUIPlugin should be idempotent: %v", err)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read updated config: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parse updated config: %v", err)
+	}
+	plugins, ok := cfg["plugin"].([]any)
+	if !ok {
+		t.Fatalf("expected plugin array")
+	}
+	if len(plugins) != 2 {
+		t.Fatalf("expected 2 plugins, got %v", plugins)
+	}
+	if plugins[0] != "existing-plugin" {
+		t.Fatalf("expected existing plugin to be preserved, got %v", plugins)
+	}
+	if plugins[1] != openCodeSubagentStatuslinePlugin {
+		t.Fatalf("expected %q to be appended, got %v", openCodeSubagentStatuslinePlugin, plugins)
+	}
+}
+
+func TestInjectOpenCodeTUIPluginConfigErrors(t *testing.T) {
+	t.Run("invalid root json", func(t *testing.T) {
+		resetSetupSeams(t)
+		home := useTestHome(t)
+		runtimeGOOS = "linux"
+		xdg := filepath.Join(home, "xdg")
+		t.Setenv("XDG_CONFIG_HOME", xdg)
+
+		configPath := filepath.Join(xdg, "opencode", "tui.json")
+		if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+			t.Fatalf("mkdir config dir: %v", err)
+		}
+		if err := os.WriteFile(configPath, []byte("{"), 0644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		err := injectOpenCodeTUIPlugin()
+		if err == nil || !strings.Contains(err.Error(), "parse config") {
+			t.Fatalf("expected parse config error, got %v", err)
+		}
+	})
+
+	t.Run("invalid plugin block", func(t *testing.T) {
+		resetSetupSeams(t)
+		home := useTestHome(t)
+		runtimeGOOS = "linux"
+		xdg := filepath.Join(home, "xdg")
+		t.Setenv("XDG_CONFIG_HOME", xdg)
+
+		configPath := filepath.Join(xdg, "opencode", "tui.json")
+		if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+			t.Fatalf("mkdir config dir: %v", err)
+		}
+		if err := os.WriteFile(configPath, []byte(`{"plugin":{"bad":true}}`), 0644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+
+		err := injectOpenCodeTUIPlugin()
+		if err == nil || !strings.Contains(err.Error(), "parse plugin block") {
+			t.Fatalf("expected parse plugin block error, got %v", err)
+		}
+	})
 }
 
 func TestInjectOpenCodeMCPConfigErrors(t *testing.T) {
@@ -1001,6 +1136,9 @@ func TestPathHelpersAcrossOSVariants(t *testing.T) {
 	if got := openCodeConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "opencode.json") {
 		t.Fatalf("unexpected linux openCodeConfigPath: %s", got)
 	}
+	if got := openCodeTUIConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "tui.json") {
+		t.Fatalf("unexpected linux openCodeTUIConfigPath: %s", got)
+	}
 	if got := openCodePluginDir(); got != filepath.Join("/home/tester", ".config", "opencode", "plugins") {
 		t.Fatalf("unexpected linux openCodePluginDir: %s", got)
 	}
@@ -1015,6 +1153,9 @@ func TestPathHelpersAcrossOSVariants(t *testing.T) {
 	if got := openCodeConfigPath(); got != filepath.Join("/xdg", "opencode", "opencode.json") {
 		t.Fatalf("unexpected linux xdg openCodeConfigPath: %s", got)
 	}
+	if got := openCodeTUIConfigPath(); got != filepath.Join("/xdg", "opencode", "tui.json") {
+		t.Fatalf("unexpected linux xdg openCodeTUIConfigPath: %s", got)
+	}
 	if got := openCodePluginDir(); got != filepath.Join("/xdg", "opencode", "plugins") {
 		t.Fatalf("unexpected linux xdg openCodePluginDir: %s", got)
 	}
@@ -1025,6 +1166,9 @@ func TestPathHelpersAcrossOSVariants(t *testing.T) {
 	// OpenCode uses ~/.config/opencode/ on ALL platforms, ignoring %APPDATA%
 	if got := openCodeConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "opencode.json") {
 		t.Fatalf("unexpected windows openCodeConfigPath: %s", got)
+	}
+	if got := openCodeTUIConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "tui.json") {
+		t.Fatalf("unexpected windows openCodeTUIConfigPath: %s", got)
 	}
 	if got := openCodePluginDir(); got != filepath.Join("/home/tester", ".config", "opencode", "plugins") {
 		t.Fatalf("unexpected windows openCodePluginDir: %s", got)
@@ -1041,6 +1185,9 @@ func TestPathHelpersAcrossOSVariants(t *testing.T) {
 	if got := openCodeConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "opencode.json") {
 		t.Fatalf("unexpected windows fallback openCodeConfigPath: %s", got)
 	}
+	if got := openCodeTUIConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "tui.json") {
+		t.Fatalf("unexpected windows fallback openCodeTUIConfigPath: %s", got)
+	}
 	if got := openCodePluginDir(); got != filepath.Join("/home/tester", ".config", "opencode", "plugins") {
 		t.Fatalf("unexpected windows fallback openCodePluginDir: %s", got)
 	}
@@ -1054,6 +1201,9 @@ func TestPathHelpersAcrossOSVariants(t *testing.T) {
 	runtimeGOOS = "plan9"
 	if got := openCodeConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "opencode.json") {
 		t.Fatalf("unexpected default openCodeConfigPath: %s", got)
+	}
+	if got := openCodeTUIConfigPath(); got != filepath.Join("/home/tester", ".config", "opencode", "tui.json") {
+		t.Fatalf("unexpected default openCodeTUIConfigPath: %s", got)
 	}
 	if got := openCodePluginDir(); got != filepath.Join("/home/tester", ".config", "opencode", "plugins") {
 		t.Fatalf("unexpected default openCodePluginDir: %s", got)
@@ -1587,6 +1737,71 @@ func TestAdditionalHelperBranches(t *testing.T) {
 	})
 }
 
+func TestClaudeCodePermissionTools(t *testing.T) {
+	tools := claudeCodePermissionTools(map[string]bool{
+		"mem_search":          true,
+		"mem_current_project": true,
+		"mem_stats":           false,
+	})
+
+	want := []string{
+		"mcp__engram__mem_current_project",
+		"mcp__engram__mem_search",
+		"mcp__plugin_engram_engram__mem_current_project",
+		"mcp__plugin_engram_engram__mem_search",
+	}
+	if !reflect.DeepEqual(tools, want) {
+		t.Fatalf("unexpected permissions:\nwant %#v\n got %#v", want, tools)
+	}
+
+	for _, tool := range []string{
+		"mcp__engram__mem_current_project",
+		"mcp__engram__mem_judge",
+		"mcp__plugin_engram_engram__mem_current_project",
+		"mcp__plugin_engram_engram__mem_judge",
+	} {
+		if !slices.Contains(claudeCodeMCPTools, tool) {
+			t.Fatalf("claudeCodeMCPTools missing current agent permission %q", tool)
+		}
+	}
+}
+
+func TestClaudeCodeMemorySkillDoesNotHardcodePluginScopedToolSearch(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "plugin", "claude-code", "skills", "memory", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("read memory skill: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, "select:mcp__plugin_engram_engram__") {
+		t.Fatalf("memory skill must not hardcode plugin-scoped ToolSearch names")
+	}
+	if !strings.Contains(text, "engram setup claude-code") {
+		t.Fatalf("memory skill fallback should direct users to repair Claude Code setup")
+	}
+}
+
+func TestClaudeCodeUserPromptHookUsesCurrentMCPServerID(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "plugin", "claude-code", "scripts", "user-prompt-submit.sh"))
+	if err != nil {
+		t.Fatalf("read user prompt hook: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, "select:mcp__plugin_engram_engram__") {
+		t.Fatalf("user prompt hook must not hardcode plugin-scoped ToolSearch names")
+	}
+	for _, tool := range []string{
+		"mcp__engram__mem_save",
+		"mcp__engram__mem_search",
+		"mcp__engram__mem_context",
+		"mcp__engram__mem_current_project",
+		"mcp__engram__mem_judge",
+	} {
+		if !strings.Contains(text, tool) {
+			t.Fatalf("user prompt hook missing current ToolSearch name %q", tool)
+		}
+	}
+}
+
 func TestAddClaudeCodeAllowlist(t *testing.T) {
 	t.Run("creates file from scratch", func(t *testing.T) {
 		resetSetupSeams(t)
@@ -1721,7 +1936,7 @@ func TestAddClaudeCodeAllowlist(t *testing.T) {
 			t.Fatalf("mkdir: %v", err)
 		}
 
-		// Include 3 of 11 tools
+		// Include 3 tools and verify only the missing permissions are appended.
 		partial := []string{
 			claudeCodeMCPTools[0],
 			claudeCodeMCPTools[3],
@@ -1976,6 +2191,43 @@ func TestOpenCodeConfigPathFallsBackToJSON(t *testing.T) {
 	}
 }
 
+func TestOpenCodeTUIConfigPathPrefersJSONC(t *testing.T) {
+	resetSetupSeams(t)
+	home := useTestHome(t)
+	runtimeGOOS = "linux"
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	statFn = func(name string) (os.FileInfo, error) {
+		if strings.HasSuffix(name, "tui.jsonc") {
+			return nil, nil
+		}
+		return nil, os.ErrNotExist
+	}
+
+	got := openCodeTUIConfigPath()
+	expected := filepath.Join(home, ".config", "opencode", "tui.jsonc")
+	if got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestOpenCodeTUIConfigPathFallsBackToJSON(t *testing.T) {
+	resetSetupSeams(t)
+	home := useTestHome(t)
+	runtimeGOOS = "linux"
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	statFn = func(name string) (os.FileInfo, error) {
+		return nil, os.ErrNotExist
+	}
+
+	got := openCodeTUIConfigPath()
+	expected := filepath.Join(home, ".config", "opencode", "tui.json")
+	if got != expected {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
 func TestOpenCodeConfigPathXDGWithJSONC(t *testing.T) {
 	resetSetupSeams(t)
 	_ = useTestHome(t)
@@ -2068,6 +2320,55 @@ func TestInjectOpenCodeMCPHandlesJSONC(t *testing.T) {
 	}
 	if _, ok := mcp["other"]; !ok {
 		t.Fatalf("expected existing 'other' entry to be preserved")
+	}
+}
+
+func TestInjectOpenCodeTUIPluginHandlesJSONC(t *testing.T) {
+	resetSetupSeams(t)
+	home := useTestHome(t)
+	runtimeGOOS = "linux"
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	configDir := filepath.Join(home, ".config", "opencode")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	jsoncPath := filepath.Join(configDir, "tui.jsonc")
+	content := `{
+  // Keep existing plugins
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [
+    "existing-plugin"
+  ]
+}`
+	if err := os.WriteFile(jsoncPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write jsonc: %v", err)
+	}
+
+	statFn = os.Stat
+
+	if err := injectOpenCodeTUIPlugin(); err != nil {
+		t.Fatalf("injectOpenCodeTUIPlugin with JSONC failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(jsoncPath)
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("result should be valid JSON: %v", err)
+	}
+	plugins, ok := cfg["plugin"].([]any)
+	if !ok {
+		t.Fatalf("expected plugin array in result")
+	}
+	if len(plugins) != 2 {
+		t.Fatalf("expected 2 plugins in result, got %v", plugins)
+	}
+	if plugins[0] != "existing-plugin" || plugins[1] != openCodeSubagentStatuslinePlugin {
+		t.Fatalf("unexpected plugins after injection: %v", plugins)
 	}
 }
 
