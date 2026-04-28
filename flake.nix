@@ -10,7 +10,7 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
-        version = "1.10.7-nova";
+        version = "1.14.5-nova";
       in
       {
         # Paquete para construir e instalar Engram
@@ -21,7 +21,7 @@
 
           # El vendorHash cambiará cuando actualices dependencias. 
           # Usamos un hash nulo para que Nix nos diga el correcto al fallar.
-          vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+          vendorHash = "sha256-O+pC4x4DKNUWr7Sx9iZOjK6a64wrQA4/lnjvkNLBX64=";
 
           subPackages = [ "cmd/engram" ];
 
